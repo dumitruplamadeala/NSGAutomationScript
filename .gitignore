@@ -1,0 +1,12 @@
+# Generated checkpoint artifacts from script runs
+/nsg-apply-checkpoint.json
+/nsg-apply-checkpoint-*.json
+/live-rules.json
+
+# Local Office temp files
+~$*.xlsx
+~$*.docx
+
+# Windows Explorer metadata
+Thumbs.db
+Desktop.ini
