@@ -1406,10 +1406,19 @@ function Test-DesiredRules {
     $errors = New-Object System.Collections.Generic.List[string]
     $warnings = New-Object System.Collections.Generic.List[string]
 
-    $duplicatePriorities = Test-DuplicateProperty -Items $Rules -PropertyName 'Priority'
+    $duplicatePriorities = @(
+        $Rules |
+        Group-Object -Property { '{0}|{1}' -f $_.Direction, $_.Priority } |
+        Where-Object { $_.Count -gt 1 }
+    )
+
     foreach ($group in $duplicatePriorities) {
+        $parts = ([string]$group.Name).Split('|', 2)
+        $direction = if ($parts.Count -ge 1) { $parts[0] } else { '?' }
+        $priority = if ($parts.Count -ge 2) { $parts[1] } else { '?' }
+
         $details = ($group.Group | ForEach-Object { "$($_.Name) [$($_.SourceSheet):$($_.OriginalRow)]" }) -join ', '
-        $errors.Add("Duplicate priority $($group.Name): $details")
+        $errors.Add("Duplicate priority '$priority' in direction '$direction': $details")
     }
 
     $duplicateNames = Test-DuplicateProperty -Items $Rules -PropertyName 'Name'
@@ -1754,7 +1763,6 @@ function Invoke-UpdateRule {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][pscustomobject]$DesiredRule,
-        [Parameter(Mandatory = $true)][pscustomobject]$LiveRule,
         [Parameter(Mandatory = $true)][string]$ResourceGroupName,
         [Parameter(Mandatory = $true)][string]$NsgName,
         [Parameter(Mandatory = $true)][string]$HumanDescription,
@@ -1777,8 +1785,10 @@ function Invoke-UpdateRule {
         DestinationAddressPrefixes  = $DesiredRule.DestinationAddressPrefixes
         DestinationPortRanges       = $DesiredRule.DestinationPortRanges
         Description                 = $updatedDescription
-        Fingerprint                 = $DesiredRule.Fingerprint
+        Fingerprint                 = $null
     }
+
+    $updatedRule.Fingerprint = New-RuleFingerprint -Rule $updatedRule
 
     [void](Invoke-NsgRuleUpdate -Rule $updatedRule -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds)
     Invoke-NsgRuleWaitUpdated -RuleName $updatedRule.Name -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
@@ -1855,7 +1865,7 @@ function Invoke-ApplyPlan {
             Name           = $item.Name
             Priority       = $item.Priority
             PlannedAction  = $item.Action
-            Status         = if ($item.Action -in @('NoChange', 'SkipApply')) { 'Skipped' } elseif ($item.Action -eq 'Conflict') { 'Blocked' } else { 'Pending' }
+            Status         = if ($item.Action -eq 'NoChange') { 'Unchanged' } elseif ($item.Action -eq 'SkipApply') { 'SkippedShadowed' } elseif ($item.Action -eq 'Conflict') { 'BlockedConflict' } else { 'Pending' }
             Reason         = $item.Reason
             LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString('o')
         }
@@ -1906,21 +1916,21 @@ function Invoke-ApplyPlan {
         $match = $executionIndex[$key]
 
         if ($item.Action -eq 'NoChange') {
-            Write-Log -Message "NOCHANGE $($item.Name) priority=$($item.Priority)" -Level INFO -Color Gray
+            Write-Log -Message "Unchanged $($item.Name) priority=$($item.Priority)" -Level INFO -Color Gray
             continue
         }
 
         if ($item.Action -eq 'Conflict') {
-            Write-Log -Message "CONFLICT $($item.Name) priority=$($item.Priority) : $($item.Reason)" -Level ERROR
+            Write-Log -Message "BlockedConflict $($item.Name) priority=$($item.Priority) : $($item.Reason)" -Level ERROR
             continue
         }
 
         if ($item.Action -eq 'SkipApply') {
-            Write-Log -Message "SKIP_APPLY $($item.Name) priority=$($item.Priority)" -Level INFO -Color DarkYellow
+            Write-Log -Message "SkippedShadowed $($item.Name) priority=$($item.Priority)" -Level INFO -Color DarkYellow
             continue
         }
 
-        $actionText = $item.Action.ToUpperInvariant()
+        $actionText = if ($item.Action -eq 'Create') { 'PendingCreate' } elseif ($item.Action -eq 'Update') { 'PendingUpdate' } else { $item.Action }
 
         switch ($item.Action) {
             'Create' { $color = 'Green' }
@@ -1947,7 +1957,7 @@ function Invoke-ApplyPlan {
                     Assert-AppliedRuleMatchesDesired -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                 }
                 'Update' {
-                    Invoke-UpdateRule -DesiredRule $item.Desired -LiveRule $item.Live -ResourceGroupName $ResourceGroupName -NsgName $NsgName -HumanDescription $HumanDescription -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+                    Invoke-UpdateRule -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -HumanDescription $HumanDescription -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                     Assert-AppliedRuleMatchesDesired -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                 }
                 default {
@@ -1991,6 +2001,14 @@ function Show-PlanSummary {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Plan)
 
+    $actionLabelMap = [ordered]@{
+        Create    = 'PendingCreate'
+        Update    = 'PendingUpdate'
+        NoChange  = 'Unchanged'
+        SkipApply = 'SkippedShadowed'
+        Conflict  = 'BlockedConflict'
+    }
+
     $defaultActions = @('Create','Update','NoChange','SkipApply','Conflict')
     $presentActions = @($Plan | ForEach-Object { $_.Action } | Sort-Object -Unique)
     $extraActions = $presentActions | Where-Object { $defaultActions -notcontains $_ }
@@ -2001,7 +2019,8 @@ function Show-PlanSummary {
     Write-Host '------------'
     foreach ($act in $allActions) {
         $count = @($Plan | Where-Object { $_.Action -eq $act }).Count
-        '{0,-10} : {1}' -f ($act.ToUpper()), $count | Write-Host
+        $label = if ($actionLabelMap.Contains($act)) { $actionLabelMap[$act] } else { $act }
+        '{0,-16} : {1}' -f $label, $count | Write-Host
     }
     Write-Host ''
 }

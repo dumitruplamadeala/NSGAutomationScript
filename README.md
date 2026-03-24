@@ -43,8 +43,8 @@ Required workbook headers:
 - `Rule Name`
 - `Rule Number`
 - `Destination Protocol`
-- `Source IP adress / Subnet / Range IP`
-- `Destionation IP adress / Subnet / Range IP`
+- `Source IP address / Subnet / Range IP`
+- `Destination IP address / Subnet / Range IP`
 - `Destination Port or Service`
 
 ## Main behavior
@@ -72,6 +72,17 @@ If you pass `-Apply`, the script:
 ## Checkpoint output
 
 The checkpoint file records the run plan and execution status.
+
+Checkpoint files are execution and audit records. They are not used to resume partial runs automatically.
+
+Execution status values:
+
+- `Unchanged`: planned action was `NoChange`
+- `SkippedShadowed`: planned action was `SkipApply` due to overlap/shadowing detection
+- `BlockedConflict`: planned action was `Conflict`
+- `Pending`: planned `Create` or `Update` that was not executed yet (for example dry-run)
+- `Completed`: planned `Create` or `Update` succeeded
+- `Failed`: planned `Create` or `Update` failed during apply
 
 Action-specific payload behavior:
 
@@ -184,7 +195,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 - `NoChange` means the live rule fingerprint already matches the desired state.
 - `Conflict` means the same priority already exists with a different rule name.
 - Overlap warnings do not stop execution unless `-FailOnShadowing` is used.
-- Shadowed rules are logged with `SKIP_APPLY` and are not sent to Azure.
+- Shadowed rules are logged as `SkippedShadowed` and are not sent to Azure.
 - The script does not delete NSG rules.
 
 ## Troubleshooting
