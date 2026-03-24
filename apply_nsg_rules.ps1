@@ -411,8 +411,8 @@ function Get-WorkbookHeaderMap {
         RuleName           = 'Rule Name'
         RuleNumber         = 'Rule Number'
         Protocol           = 'Destination Protocol'
-        SourceAddress      = 'Source IP adress / Subnet / Range IP'
-        DestinationAddress = 'Destionation IP adress / Subnet / Range IP'
+        SourceAddress      = 'Source IP address / Subnet / Range IP'
+        DestinationAddress = 'Destination IP address / Subnet / Range IP'
         DestinationPorts   = 'Destination Port or Service'
     }
 }
@@ -479,12 +479,35 @@ function Split-NormalizedList {
         [switch]$KeepAnyAsWildcard
     )
 
-    $raw = Convert-AnyToken -Value $Value
-    if ($raw -eq '*') {
-        if ($KeepAnyAsWildcard) { return @('*') }
-        return @()
+    $raw = ''
+    if ($null -ne $Value -and $Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $parts = @()
+        foreach ($entry in @($Value)) {
+            $token = Convert-AnyToken -Value $entry
+            if ($token -eq '*') {
+                if ($KeepAnyAsWildcard) { return @('*') }
+                continue
+            }
+
+            $parts += $token
+        }
+
+        if ($parts.Count -eq 0) {
+            if ($KeepAnyAsWildcard) { return @('*') }
+            return @()
+        }
+
+        $raw = ($parts -join ';')
+    }
+    else {
+        $raw = Convert-AnyToken -Value $Value
+        if ($raw -eq '*') {
+            if ($KeepAnyAsWildcard) { return @('*') }
+            return @()
+        }
     }
 
+    $raw = [string]$raw
     $raw = $raw -replace "`r`n|`n|`r", ';'
 
     $pattern = '[' + (($Delimiters | ForEach-Object { [Regex]::Escape($_) }) -join '') + ']'
@@ -604,6 +627,18 @@ function Test-ValidServiceTag {
     return $Value -in $allowed
 }
 
+function Get-CanonicalServiceTag {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    switch ($Value.Trim().ToUpperInvariant()) {
+        'VIRTUALNETWORK'   { return 'VirtualNetwork' }
+        'AZURELOADBALANCER' { return 'AzureLoadBalancer' }
+        'INTERNET'         { return 'Internet' }
+        default            { return $Value.Trim() }
+    }
+}
+
 function Test-ValidIpOrCidrOrRangeOrWildcardOrServiceTag {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -628,6 +663,10 @@ function Normalize-AddressPrefixes {
 
         if (-not (Test-ValidIpOrCidrOrRangeOrWildcardOrServiceTag -Value $candidate)) {
             throw "Invalid address token '$token'. Allowed values: explicit '*', IPv4, CIDR, IPv4 range, or supported service tags."
+        }
+
+        if ($candidate -ne '*' -and (Test-ValidServiceTag -Value $candidate)) {
+            $candidate = Get-CanonicalServiceTag -Value $candidate
         }
 
         $candidate
@@ -976,6 +1015,97 @@ function Test-DuplicateProperty {
     )
 }
 
+function Convert-AzNsgRuleToLiveRule {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()][object]$Rule
+    )
+
+    if ($null -eq $Rule) {
+        return $null
+    }
+
+    $props = $Rule.PSObject.Properties.Name
+
+    $sourcePrefixes = @()
+    if (($props -contains 'sourceAddressPrefixes') -and $Rule.sourceAddressPrefixes) {
+        $sourcePrefixes = @($Rule.sourceAddressPrefixes)
+    }
+    elseif (($props -contains 'sourceAddressPrefix') -and $Rule.sourceAddressPrefix) {
+        $sourcePrefixes = @($Rule.sourceAddressPrefix)
+    }
+    else {
+        $sourcePrefixes = @('*')
+    }
+
+    $destinationPrefixes = @()
+    if (($props -contains 'destinationAddressPrefixes') -and $Rule.destinationAddressPrefixes) {
+        $destinationPrefixes = @($Rule.destinationAddressPrefixes)
+    }
+    elseif (($props -contains 'destinationAddressPrefix') -and $Rule.destinationAddressPrefix) {
+        $destinationPrefixes = @($Rule.destinationAddressPrefix)
+    }
+    else {
+        $destinationPrefixes = @('*')
+    }
+
+    $sourcePorts = @()
+    if (($props -contains 'sourcePortRanges') -and $Rule.sourcePortRanges) {
+        $sourcePorts = @($Rule.sourcePortRanges)
+    }
+    elseif (($props -contains 'sourcePortRange') -and $Rule.sourcePortRange) {
+        $sourcePorts = @($Rule.sourcePortRange)
+    }
+    else {
+        $sourcePorts = @('*')
+    }
+
+    $destinationPorts = @()
+    if (($props -contains 'destinationPortRanges') -and $Rule.destinationPortRanges) {
+        $destinationPorts = @($Rule.destinationPortRanges)
+    }
+    elseif (($props -contains 'destinationPortRange') -and $Rule.destinationPortRange) {
+        $destinationPorts = @($Rule.destinationPortRange)
+    }
+    else {
+        $destinationPorts = @('*')
+    }
+
+    $description = ''
+    if (($props -contains 'description') -and $Rule.description) {
+        $description = [string]$Rule.description
+    }
+
+    $protocolRaw = '*'
+    if (($props -contains 'protocol') -and $Rule.protocol) {
+        $protocolRaw = [string]$Rule.protocol
+    }
+
+    $protocolNormalized = Normalize-Protocol -Value $protocolRaw
+    $sourcePortsNormalized = Normalize-Ports -Value $sourcePorts
+    $sourcePrefixesNormalized = Normalize-AddressPrefixes -Value $sourcePrefixes
+    $destinationPrefixesNormalized = Normalize-AddressPrefixes -Value $destinationPrefixes
+    $destinationPortsNormalized = Normalize-Ports -Value $destinationPorts
+
+    $liveRule = [pscustomobject]@{
+        Name                       = if (($props -contains 'name') -and $Rule.name) { [string]$Rule.name } else { '' }
+        Priority                   = if (($props -contains 'priority') -and $null -ne $Rule.priority) { [int]$Rule.priority } else { 0 }
+        Direction                  = if (($props -contains 'direction') -and $Rule.direction) { [string]$Rule.direction } else { '' }
+        Access                     = if (($props -contains 'access') -and $Rule.access) { [string]$Rule.access } else { '' }
+        Protocol                   = $protocolNormalized
+        SourcePortRanges           = @($sourcePortsNormalized)
+        SourceAddressPrefixes      = @($sourcePrefixesNormalized)
+        DestinationAddressPrefixes = @($destinationPrefixesNormalized)
+        DestinationPortRanges      = @($destinationPortsNormalized)
+        Description                = $description
+        Fingerprint                = $null
+    }
+
+    $liveRule.Fingerprint = New-RuleFingerprint -Rule $liveRule
+    return $liveRule
+}
+
 function Get-LiveNsgRules {
     [CmdletBinding()]
     param(
@@ -1000,78 +1130,39 @@ function Get-LiveNsgRules {
     $liveRules = @($parsed)
 
     $normalized = foreach ($rule in $liveRules) {
-        if (-not $rule) { continue }
-
-        $props = $rule.PSObject.Properties.Name
-
-        $sourcePrefixes = @()
-        if (($props -contains 'sourceAddressPrefixes') -and $rule.sourceAddressPrefixes) {
-            $sourcePrefixes = @($rule.sourceAddressPrefixes)
+        $liveRule = Convert-AzNsgRuleToLiveRule -Rule $rule
+        if ($null -ne $liveRule) {
+            $liveRule
         }
-        elseif (($props -contains 'sourceAddressPrefix') -and $rule.sourceAddressPrefix) {
-            $sourcePrefixes = @($rule.sourceAddressPrefix)
-        }
-        else {
-            $sourcePrefixes = @('*')
-        }
-
-        $destinationPrefixes = @()
-        if (($props -contains 'destinationAddressPrefixes') -and $rule.destinationAddressPrefixes) {
-            $destinationPrefixes = @($rule.destinationAddressPrefixes)
-        }
-        elseif (($props -contains 'destinationAddressPrefix') -and $rule.destinationAddressPrefix) {
-            $destinationPrefixes = @($rule.destinationAddressPrefix)
-        }
-        else {
-            $destinationPrefixes = @('*')
-        }
-
-        $sourcePorts = @()
-        if (($props -contains 'sourcePortRanges') -and $rule.sourcePortRanges) {
-            $sourcePorts = @($rule.sourcePortRanges)
-        }
-        elseif (($props -contains 'sourcePortRange') -and $rule.sourcePortRange) {
-            $sourcePorts = @($rule.sourcePortRange)
-        }
-        else {
-            $sourcePorts = @('*')
-        }
-
-        $destinationPorts = @()
-        if (($props -contains 'destinationPortRanges') -and $rule.destinationPortRanges) {
-            $destinationPorts = @($rule.destinationPortRanges)
-        }
-        elseif (($props -contains 'destinationPortRange') -and $rule.destinationPortRange) {
-            $destinationPorts = @($rule.destinationPortRange)
-        }
-        else {
-            $destinationPorts = @('*')
-        }
-
-        $description = ''
-        if (($props -contains 'description') -and $rule.description) {
-            $description = [string]$rule.description
-        }
-
-        $liveRule = [pscustomobject]@{
-            Name                       = if (($props -contains 'name') -and $rule.name) { [string]$rule.name } else { '' }
-            Priority                   = if (($props -contains 'priority') -and $null -ne $rule.priority) { [int]$rule.priority } else { 0 }
-            Direction                  = if (($props -contains 'direction') -and $rule.direction) { [string]$rule.direction } else { '' }
-            Access                     = if (($props -contains 'access') -and $rule.access) { [string]$rule.access } else { '' }
-            Protocol                   = if (($props -contains 'protocol') -and $rule.protocol) { [string]$rule.protocol } else { '' }
-            SourcePortRanges           = @($sourcePorts | ForEach-Object { Convert-AnyToken $_ } | Sort-Object -Unique)
-            SourceAddressPrefixes      = @($sourcePrefixes | ForEach-Object { Convert-AnyToken $_ } | Sort-Object -Unique)
-            DestinationAddressPrefixes = @($destinationPrefixes | ForEach-Object { Convert-AnyToken $_ } | Sort-Object -Unique)
-            DestinationPortRanges      = @($destinationPorts | ForEach-Object { Convert-AnyToken $_ } | Sort-Object -Unique)
-            Description                = $description
-            Fingerprint                = $null
-        }
-
-        $liveRule.Fingerprint = New-RuleFingerprint -Rule $liveRule
-        $liveRule
     }
 
     return ,@($normalized | Sort-Object Direction, Priority, Name)
+}
+
+function Get-LiveNsgRuleByName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)][string]$NsgName,
+        [Parameter(Mandatory = $true)][string]$RuleName,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5
+    )
+
+    $parsed = Invoke-AzCliJson -Arguments @(
+        'network', 'nsg', 'rule', 'show',
+        '--resource-group', $ResourceGroupName,
+        '--nsg-name', $NsgName,
+        '--name', $RuleName,
+        '--output', 'json',
+        '--only-show-errors'
+    ) -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -OperationName "az network nsg rule show $RuleName"
+
+    if ($null -eq $parsed) {
+        return $null
+    }
+
+    return Convert-AzNsgRuleToLiveRule -Rule $parsed
 }
 
 function Parse-AddressToken {
@@ -1292,7 +1383,7 @@ function Get-OverlapFindings {
                 ShadowedByName    = $previous.Name
                 ShadowedByPriority= $previous.Priority
                 ShadowedByAccess  = $previous.Access
-                Message           = "Rule '$($current.Name)' may be fully covered by higher-precedence rule '$($previous.Name)' (priority $($previous.Priority), access $($previous.Access)). First-match NSG processing can make '$($current.Name)' ineffective for matching traffic. Rule will be not applied."
+                Message           = "Rule '$($current.Name)' may be fully covered by higher-precedence rule '$($previous.Name)' (priority $($previous.Priority), access $($previous.Access)). First-match NSG processing can make '$($current.Name)' ineffective for matching traffic. By default this script marks it as SkipApply to avoid deploying likely redundant intent."
             }
             break
         }
@@ -1707,6 +1798,41 @@ function Invoke-CreateRule {
     Invoke-NsgRuleWaitCreated -RuleName $DesiredRule.Name -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
 }
 
+function Assert-AppliedRuleMatchesDesired {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject]$DesiredRule,
+        [Parameter(Mandatory = $true)][string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)][string]$NsgName,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5
+    )
+
+    $liveRule = Get-LiveNsgRuleByName -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RuleName $DesiredRule.Name -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+    if ($null -eq $liveRule) {
+        throw "Post-apply verification failed for rule '$($DesiredRule.Name)'. Azure did not return the rule after apply."
+    }
+
+    if ($liveRule.Fingerprint -ne $DesiredRule.Fingerprint) {
+        $liveView = Convert-RuleToCheckpointView -Rule $liveRule
+        $desiredView = Convert-RuleToCheckpointView -Rule $DesiredRule
+        $changes = @(Compare-RuleForCheckpoint -Before $liveView -After $desiredView)
+
+        $details = if ($changes.Count -gt 0) {
+            ($changes | ForEach-Object {
+                $actual = if ($null -eq $_.Before) { 'null' } else { (ConvertTo-Json -InputObject $_.Before -Compress -Depth 10) }
+                $expected = if ($null -eq $_.After) { 'null' } else { (ConvertTo-Json -InputObject $_.After -Compress -Depth 10) }
+                "$($_.Field): expected=$expected actual=$actual"
+            }) -join '; '
+        }
+        else {
+            'No field-level differences were computed, but fingerprint mismatch was detected.'
+        }
+
+        throw "Post-apply verification failed for rule '$($DesiredRule.Name)'. Live Azure rule does not match desired normalized state. $details"
+    }
+}
+
 function Invoke-ApplyPlan {
     [CmdletBinding()]
     param(
@@ -1818,9 +1944,11 @@ function Invoke-ApplyPlan {
             switch ($item.Action) {
                 'Create' {
                     Invoke-CreateRule -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+                    Assert-AppliedRuleMatchesDesired -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                 }
                 'Update' {
                     Invoke-UpdateRule -DesiredRule $item.Desired -LiveRule $item.Live -ResourceGroupName $ResourceGroupName -NsgName $NsgName -HumanDescription $HumanDescription -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+                    Assert-AppliedRuleMatchesDesired -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                 }
                 default {
                     throw "Unsupported planned action '$($item.Action)'"
