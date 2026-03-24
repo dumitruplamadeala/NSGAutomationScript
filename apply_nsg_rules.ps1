@@ -1372,17 +1372,36 @@ function New-ApplyPlan {
     foreach ($item in $LiveRules) {
         $liveByName[$item.Name] = $item
 
-        $priorityKey = '{0}|{1}' -f $item.Direction, $item.Priority
-        if (-not $liveByDirectionPriority.ContainsKey($priorityKey)) {
-            $liveByDirectionPriority[$priorityKey] = $item
+        if ($item.Priority -ge 100 -and $item.Priority -le 4096) {
+            $liveDirectionKey = ([string]$item.Direction).Trim().ToUpperInvariant()
+            $priorityKey = '{0}|{1}' -f $liveDirectionKey, $item.Priority
+            if (-not $liveByDirectionPriority.ContainsKey($priorityKey)) {
+                $liveByDirectionPriority[$priorityKey] = $item
+            }
         }
     }
 
     foreach ($desired in $DesiredRules) {
-        $priorityKey = '{0}|{1}' -f $desired.Direction, $desired.Priority
+        $desiredDirectionKey = ([string]$desired.Direction).Trim().ToUpperInvariant()
+        $priorityKey = '{0}|{1}' -f $desiredDirectionKey, $desired.Priority
 
         if ($liveByName.ContainsKey($desired.Name)) {
             $live = $liveByName[$desired.Name]
+
+            if ($liveByDirectionPriority.ContainsKey($priorityKey)) {
+                $priorityOwner = $liveByDirectionPriority[$priorityKey]
+                if ($priorityOwner.Name -ine $desired.Name) {
+                    $plan.Add([pscustomobject]@{
+                        Action   = 'Conflict'
+                        Name     = $desired.Name
+                        Priority = $desired.Priority
+                        Desired  = $desired
+                        Live     = $priorityOwner
+                        Reason   = "Cannot update rule '$($desired.Name)' to direction '$($desired.Direction)' priority '$($desired.Priority)' because that priority is already used by existing rule '$($priorityOwner.Name)'."
+                    })
+                    continue
+                }
+            }
 
             if ($desired.Fingerprint -eq $live.Fingerprint) {
                 $plan.Add([pscustomobject]@{
@@ -1844,12 +1863,17 @@ function Show-PlanSummary {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Plan)
 
-    $grouped = $Plan | Group-Object Action | Sort-Object Name
+    $defaultActions = @('Create','Update','NoChange','SkipApply','Conflict')
+    $presentActions = @($Plan | ForEach-Object { $_.Action } | Sort-Object -Unique)
+    $extraActions = $presentActions | Where-Object { $defaultActions -notcontains $_ }
+    $allActions = $defaultActions + $extraActions
+
     Write-Host ''
     Write-Host 'PLAN SUMMARY'
     Write-Host '------------'
-    foreach ($group in $grouped) {
-        '{0,-10} : {1}' -f $group.Name, $group.Count | Write-Host
+    foreach ($act in $allActions) {
+        $count = @($Plan | Where-Object { $_.Action -eq $act }).Count
+        '{0,-10} : {1}' -f ($act.ToUpper()), $count | Write-Host
     }
     Write-Host ''
 }
@@ -1931,7 +1955,9 @@ Show-PlanSummary -Plan $plan
 
 $conflicts = @($plan | Where-Object { $_.Action -eq 'Conflict' })
 if ($conflicts.Count -gt 0) {
-    Write-Log -Message "One or more conflicts were detected. These rules will not be modified because they look like a rename or a priority collision." -Level WARN
+    $details = ($conflicts | ForEach-Object { "$($_.Name) priority=$($_.Priority) existing=$($($_.Live).Name)" }) -join '; '
+    Write-Log -Message "Priority collision conflict(s) detected: $details" -Level ERROR
+    throw "Priority collision(s) detected. Resolve the conflicting priorities and re-run the script. Conflicts: $details"
 }
 
 $checkpointTargets = Resolve-CheckpointTargets -CheckpointPath $CheckpointPath -CheckpointMode $CheckpointMode -Apply:$Apply
