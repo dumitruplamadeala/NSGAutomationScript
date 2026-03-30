@@ -134,7 +134,7 @@ This is useful when you want both history and a predictable latest file.
   -WorkbookPath .\dummyData.xlsx `
   -ResourceGroupName "NSG-test-script" `
   -NsgName "nsg-ci-automation-app" `
-  -Description "RITM12345 - NY5678 - 03/20/2026 - Update"
+  -Description "RITM12345 - NY5678 - 03/20/2026 - Create"
 ```
 
 ### Dry-run with explicit checkpoint file
@@ -169,7 +169,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
   -WorkbookPath .\dummyData.xlsx `
   -ResourceGroupName "NSG-test-script" `
   -NsgName "nsg-ci-automation-app" `
-  -Description "RITM12345 - NY5678 - 03/20/2026 - Update" `
+  -Description "RITM12345 - NY5678 - 03/20/2026 - Create" `
   -SkipPreflight
 ```
 
