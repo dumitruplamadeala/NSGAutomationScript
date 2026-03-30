@@ -798,10 +798,10 @@ function New-ManagedRuleDescription {
         throw "Introduce Description as: RITMxxxx - NYxxxx - Date(mm/dd/yyyy) - Action(Create/Update)"
     }
 
-    $pattern = '^RITM\d+\s-\sNY\d+\s-\s\d{2}/\d{2}/\d{4}\s-\s(Create|Update)$'
-    if ($description -notmatch $pattern) {
-        throw "Description format invalid. Expected: RITMxxxx - NYxxxx - mm/dd/yyyy - Create|Update"
-    }
+    # $pattern = '^RITM\d+\s-\sNY\d+\s-\s\d{2}/\d{2}/\d{4}\s-\s(Create|Update)$'
+    # if ($description -notmatch $pattern) {
+    #     throw "Description format invalid. Expected: RITMxxxx - NYxxxx - mm/dd/yyyy - Create|Update"
+    # }
 
     if ($description.Length -gt 140) {
         throw "Description exceeds Azure 140 character limit. Reduce -Description length."

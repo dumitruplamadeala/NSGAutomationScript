@@ -10,7 +10,7 @@ The script is built for Windows PowerShell 5.1 and uses Azure CLI plus the `Impo
 
 For each run, the script:
 
-1. Validates prerequisites unless `-SkipPreflight` is used.
+1. Validates prerequisites 
 2. Reads the workbook sheets configured through `-SheetNames`.
 3. Validates and normalizes workbook values.
 4. Loads the live rules from the target NSG.
