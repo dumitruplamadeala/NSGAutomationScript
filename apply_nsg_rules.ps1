@@ -73,7 +73,7 @@ Maximum retry attempts for Azure CLI calls.
 Delay between Azure CLI retry attempts.
 
 .PARAMETER Description
-Managed description applied to new and updated rules.
+Managed description applied to new rules and appended to existing Azure descriptions when a rule update is required.
 Expected format: RITMxxxx - NYxxxx - mm/dd/yyyy - Create|Update
 
 .EXAMPLE
@@ -810,6 +810,40 @@ function New-ManagedRuleDescription {
     return $description
 }
 
+function Merge-ManagedRuleDescription {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$ExistingDescription,
+
+        [Parameter(Mandatory = $true)]
+        [string]$HumanDescription
+    )
+
+    $newDescription = New-ManagedRuleDescription -HumanDescription $HumanDescription
+    $existing = if ($null -eq $ExistingDescription) { '' } else { $ExistingDescription.Trim() }
+
+    if ([string]::IsNullOrWhiteSpace($existing)) {
+        return $newDescription
+    }
+
+    $existingEntries = @(
+        $existing -split ';' |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($existingEntries -contains $newDescription) {
+        return $existing
+    }
+
+    $merged = "$existing; $newDescription"
+    if ($merged.Length -gt 140) {
+        throw "Merged description exceeds Azure 140 character limit. Existing='$existing' New='$newDescription'"
+    }
+
+    return $merged
+}
+
 function New-RuleFingerprint {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][pscustomobject]$Rule)
@@ -1440,14 +1474,28 @@ function Test-DesiredRules {
     }
 }
 
-function New-UpdatedDescription {
+function New-PlannedRule {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$HumanDescription
+        [Parameter(Mandatory = $true)][pscustomobject]$Rule,
+        [Parameter(Mandatory = $true)][string]$Description
     )
 
-    return New-ManagedRuleDescription -HumanDescription $HumanDescription
+    return [pscustomobject]@{
+        SourceSheet                 = $Rule.SourceSheet
+        OriginalRow                 = $Rule.OriginalRow
+        Priority                    = $Rule.Priority
+        Name                        = $Rule.Name
+        Direction                   = $Rule.Direction
+        Access                      = $Rule.Access
+        Protocol                    = $Rule.Protocol
+        SourcePortRanges            = @($Rule.SourcePortRanges)
+        SourceAddressPrefixes       = @($Rule.SourceAddressPrefixes)
+        DestinationAddressPrefixes  = @($Rule.DestinationAddressPrefixes)
+        DestinationPortRanges       = @($Rule.DestinationPortRanges)
+        Description                 = $Description
+        Fingerprint                 = $Rule.Fingerprint
+    }
 }
 
 function New-ApplyPlan {
@@ -1487,6 +1535,7 @@ function New-ApplyPlan {
 
         if ($liveByName.ContainsKey($desired.Name)) {
             $live = $liveByName[$desired.Name]
+            $plannedDescription = $null
 
             if ($liveByDirectionPriority.ContainsKey($priorityKey)) {
                 $priorityOwner = $liveByDirectionPriority[$priorityKey]
@@ -1515,11 +1564,14 @@ function New-ApplyPlan {
                 continue
             }
 
+            $plannedDescription = Merge-ManagedRuleDescription -ExistingDescription $live.Description -HumanDescription $desired.Description
+            $plannedDesired = New-PlannedRule -Rule $desired -Description $plannedDescription
+
             $plan.Add([pscustomobject]@{
                 Action   = 'Update'
                 Name     = $desired.Name
                 Priority = $desired.Priority
-                Desired  = $desired
+                Desired  = $plannedDesired
                 Live     = $live
                 Reason   = if ($overlapByRuleName.ContainsKey($desired.Name)) { $overlapByRuleName[$desired.Name].Message } else { 'Live rule with same name differs from desired state and will be updated in place.' }
             })
@@ -1765,33 +1817,12 @@ function Invoke-UpdateRule {
         [Parameter(Mandatory = $true)][pscustomobject]$DesiredRule,
         [Parameter(Mandatory = $true)][string]$ResourceGroupName,
         [Parameter(Mandatory = $true)][string]$NsgName,
-        [Parameter(Mandatory = $true)][string]$HumanDescription,
         [int]$RetryCount = 3,
         [int]$RetryDelaySeconds = 5
     )
 
-    $updatedDescription = New-UpdatedDescription -HumanDescription $HumanDescription
-
-    $updatedRule = [pscustomobject]@{
-        SourceSheet                 = $DesiredRule.SourceSheet
-        OriginalRow                 = $DesiredRule.OriginalRow
-        Priority                    = $DesiredRule.Priority
-        Name                        = $DesiredRule.Name
-        Direction                   = $DesiredRule.Direction
-        Access                      = $DesiredRule.Access
-        Protocol                    = $DesiredRule.Protocol
-        SourcePortRanges            = $DesiredRule.SourcePortRanges
-        SourceAddressPrefixes       = $DesiredRule.SourceAddressPrefixes
-        DestinationAddressPrefixes  = $DesiredRule.DestinationAddressPrefixes
-        DestinationPortRanges       = $DesiredRule.DestinationPortRanges
-        Description                 = $updatedDescription
-        Fingerprint                 = $null
-    }
-
-    $updatedRule.Fingerprint = New-RuleFingerprint -Rule $updatedRule
-
-    [void](Invoke-NsgRuleUpdate -Rule $updatedRule -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds)
-    Invoke-NsgRuleWaitUpdated -RuleName $updatedRule.Name -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+    [void](Invoke-NsgRuleUpdate -Rule $DesiredRule -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds)
+    Invoke-NsgRuleWaitUpdated -RuleName $DesiredRule.Name -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
 }
 
 function Invoke-CreateRule {
@@ -1844,14 +1875,13 @@ function Assert-AppliedRuleMatchesDesired {
 }
 
 function Invoke-ApplyPlan {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Plan,
         [Parameter(Mandatory = $true)][string]$ResourceGroupName,
         [Parameter(Mandatory = $true)][string]$NsgName,
         [Parameter(Mandatory = $true)][string]$CheckpointPath,
         [string]$LatestCheckpointPath = '',
-        [Parameter(Mandatory = $true)][string]$HumanDescription,
         [int]$RetryCount = 3,
         [int]$RetryDelaySeconds = 5,
         [switch]$Apply
@@ -1957,7 +1987,7 @@ function Invoke-ApplyPlan {
                     Assert-AppliedRuleMatchesDesired -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                 }
                 'Update' {
-                    Invoke-UpdateRule -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -HumanDescription $HumanDescription -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+                    Invoke-UpdateRule -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                     Assert-AppliedRuleMatchesDesired -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                 }
                 default {
@@ -2113,7 +2143,7 @@ if (-not [string]::IsNullOrWhiteSpace($checkpointTargets.LatestPath)) {
     Write-Log -Message "Checkpoint latest file '$($checkpointTargets.LatestPath)' will also be updated." -Level INFO
 }
 
-$execution = Invoke-ApplyPlan -Plan $plan -ResourceGroupName $ResourceGroupName -NsgName $NsgName -CheckpointPath $checkpointTargets.RunPath -LatestCheckpointPath $checkpointTargets.LatestPath -HumanDescription $Description -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -Apply:$Apply
+$execution = Invoke-ApplyPlan -Plan $plan -ResourceGroupName $ResourceGroupName -NsgName $NsgName -CheckpointPath $checkpointTargets.RunPath -LatestCheckpointPath $checkpointTargets.LatestPath -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -Apply:$Apply
 
 if ($PassThru) {
     $execution
