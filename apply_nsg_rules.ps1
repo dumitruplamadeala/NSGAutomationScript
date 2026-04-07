@@ -78,7 +78,7 @@ Expected format: RITMxxxx - NYxxxx - mm/dd/yyyy - Create|Update
 
 .EXAMPLE
 .\v5apply_nsg_rules.ps1 `
-    -WorkbookPath .\dummyData.xlsx `
+    -WorkbookPath .\mockData.xlsx `
     -ResourceGroupName "NSG-test-script" `
     -NsgName "nsg-ci-automation-app" `
     -Description "RITM12345 - NY5678 - 03/20/2026 - Update"
@@ -87,7 +87,7 @@ Runs a dry-run and updates the checkpoint file without changing Azure resources.
 
 .EXAMPLE
 .\v5apply_nsg_rules.ps1 `
-    -WorkbookPath .\dummyData.xlsx `
+    -WorkbookPath .\mockData.xlsx `
     -ResourceGroupName "NSG-test-script" `
     -NsgName "nsg-ci-automation-app" `
     -Description "RITM12345 - NY5678 - 03/20/2026 - Update" `
@@ -99,7 +99,7 @@ Applies Create and Update actions that are not shadowed and stores both a stable
 .EXAMPLE
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\v5apply_nsg_rules.ps1 `
-    -WorkbookPath .\dummyData.xlsx `
+    -WorkbookPath .\mockData.xlsx `
     -ResourceGroupName "NSG-test-script" `
     -NsgName "nsg-ci-automation-app" `
     -Description "RITM12345 - NY5678 - 03/20/2026 - Update" `

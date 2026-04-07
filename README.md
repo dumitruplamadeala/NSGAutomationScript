@@ -131,7 +131,7 @@ This is useful when you want both history and a predictable latest file.
 
 ```powershell
 .\apply_nsg_rules.ps1 `
-  -WorkbookPath .\dummyData.xlsx `
+  -WorkbookPath .\mockData.xlsx `
   -ResourceGroupName "NSG-test-script" `
   -NsgName "nsg-ci-automation-app" `
   -Description "RITM12345 - NY5678 - 03/20/2026 - Create"
@@ -141,7 +141,7 @@ This is useful when you want both history and a predictable latest file.
 
 ```powershell
 .\apply_nsg_rules.ps1 `
-  -WorkbookPath .\dummyData.xlsx `
+  -WorkbookPath .\mockData.xlsx `
   -ResourceGroupName "NSG-test-script" `
   -NsgName "nsg-ci-automation-app" `
   -Description "RITM12345 - NY5678 - 03/20/2026 - Update" `
@@ -153,7 +153,7 @@ This is useful when you want both history and a predictable latest file.
 
 ```powershell
 .\apply_nsg_rules.ps1 `
-  -WorkbookPath .\dummyData.xlsx `
+  -WorkbookPath .\mockData.xlsx `
   -ResourceGroupName "NSG-test-script" `
   -NsgName "nsg-ci-automation-app" `
   -Description "RITM12345 - NY5678 - 03/20/2026 - Update" `
@@ -166,11 +166,10 @@ This is useful when you want both history and a predictable latest file.
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\apply_nsg_rules.ps1 `
-  -WorkbookPath .\dummyData.xlsx `
+  -WorkbookPath .\mockData.xlsx `
   -ResourceGroupName "NSG-test-script" `
   -NsgName "nsg-ci-automation-app" `
   -Description "RITM12345 - NY5678 - 03/20/2026 - Create" `
-  -SkipPreflight
 ```
 
 ## Important parameters
