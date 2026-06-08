@@ -5,7 +5,7 @@ Imports NSG rule intent from an Excel workbook, compares it with a target Azure 
 .DESCRIPTION
 This script validates workbook structure and content, loads the current NSG rules from Azure,
 builds an execution plan, writes a checkpoint file, and optionally applies Create and Update
-operations to the target NSG while skipping shadowed rules.
+operations and Remove operations to the target NSG while skipping shadowed rules.
 
 The script is designed for Windows PowerShell 5.1 and Azure CLI based execution.
 
@@ -14,9 +14,9 @@ High-level flow:
 2. Read workbook rules from the configured worksheets.
 3. Normalize and validate workbook values.
 4. Load live NSG rules from Azure.
-5. Build a plan containing NoChange, Create, Update, SkipApply, and Conflict actions.
+5. Build a plan containing NoChange, Create, Update, Remove, SkipApply, and Conflict actions.
 6. Save a checkpoint JSON file for the current run.
-7. If -Apply is provided, execute Create and Update actions that are not shadowed.
+7. If -Apply is provided, execute Create, Update, and Remove actions that are not shadowed.
 
 .PARAMETER WorkbookPath
 Path to the Excel workbook that contains the desired NSG rules.
@@ -414,6 +414,7 @@ function Get-WorkbookHeaderMap {
         SourceAddress      = 'Source IP address / Subnet / Range IP'
         DestinationAddress = 'Destination IP address / Subnet / Range IP'
         DestinationPorts   = 'Destination Port or Service'
+        Action             = 'Action'
     }
 }
 
@@ -426,7 +427,12 @@ function Assert-WorkbookSchema {
 
     $package = Open-ExcelPackage -Path $Path
     try {
-        $requiredHeaders = @((Get-WorkbookHeaderMap).Values)
+        $headerMap = Get-WorkbookHeaderMap
+        $requiredHeaders = @(
+            $headerMap.GetEnumerator() |
+            Where-Object { $_.Key -ne 'Action' } |
+            ForEach-Object { $_.Value }
+        )
 
         foreach ($sheetName in $SheetNames) {
             $worksheet = $package.Workbook.Worksheets[$sheetName]
@@ -785,6 +791,25 @@ function Normalize-RuleName {
     return $name
 }
 
+
+function Normalize-WorkbookAction {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return 'Upsert'
+    }
+
+    switch (([string]$Value).Trim().ToUpperInvariant()) {
+        'CREATE' { return 'Upsert' }
+        'UPDATE' { return 'Upsert' }
+        'UPSERT' { return 'Upsert' }
+        'REMOVE' { return 'Remove' }
+        'DELETE' { return 'Remove' }
+        default  { throw "Invalid Action '$Value'. Allowed values: Create, Update, Upsert, Remove, Delete." }
+    }
+}
+
 function New-ManagedRuleDescription {
     [CmdletBinding()]
     param(
@@ -921,6 +946,53 @@ function Convert-WorksheetRowToRule {
 
     $headers = Get-WorkbookHeaderMap
 
+    $actionRaw = Get-RowPropertyValue -Row $Row -CandidateNames @($headers.Action)
+    try {
+        $desiredAction = Normalize-WorkbookAction -Value $actionRaw
+    }
+    catch {
+        throw "Validation error in sheet '$SheetName', row $RowNumber, column '$($headers.Action)'. Value: '$actionRaw'. $($_.Exception.Message)"
+    }
+
+    if ($desiredAction -eq 'Remove') {
+        $ruleNameRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.RuleName) -FieldLabel $headers.RuleName
+
+        try {
+            $ruleName = Normalize-RuleName -Value ([string]$ruleNameRaw)
+        }
+        catch {
+            throw "Validation error in sheet '$SheetName', row $RowNumber, column '$($headers.RuleName)'. Value: '$ruleNameRaw'. $($_.Exception.Message)"
+        }
+
+        $priority = 0
+        $priorityRawForRemove = Get-RowPropertyValue -Row $Row -CandidateNames @($headers.RuleNumber)
+        if ($null -ne $priorityRawForRemove -and -not [string]::IsNullOrWhiteSpace([string]$priorityRawForRemove)) {
+            if (-not [int]::TryParse([string]$priorityRawForRemove, [ref]$priority)) {
+                throw "Validation error in sheet '$SheetName', row $RowNumber, column '$($headers.RuleNumber)'. Value: '$priorityRawForRemove'. Rule Number must be an integer when provided for Remove."
+            }
+        }
+
+        $rule = [pscustomobject]@{
+            SourceSheet                 = $SheetName
+            OriginalRow                 = $RowNumber
+            DesiredAction               = $desiredAction
+            Priority                    = $priority
+            Name                        = $ruleName
+            Direction                   = $Direction
+            Access                      = 'Allow'
+            Protocol                    = '*'
+            SourcePortRanges            = @('*')
+            SourceAddressPrefixes       = @('*')
+            DestinationAddressPrefixes  = @('*')
+            DestinationPortRanges       = @('*')
+            Description                 = ''
+            Fingerprint                 = $null
+        }
+
+        $rule.Fingerprint = New-RuleFingerprint -Rule $rule
+        return $rule
+    }
+
     $priorityRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.RuleNumber) -FieldLabel $headers.RuleNumber
     $ruleNameRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.RuleName) -FieldLabel $headers.RuleName
     $protocolRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.Protocol) -FieldLabel $headers.Protocol
@@ -982,6 +1054,7 @@ function Convert-WorksheetRowToRule {
     $rule = [pscustomobject]@{
         SourceSheet                 = $SheetName
         OriginalRow                 = $RowNumber
+        DesiredAction               = $desiredAction
         Priority                    = $priority
         Name                        = $ruleName
         Direction                   = $Direction
@@ -1440,8 +1513,12 @@ function Test-DesiredRules {
     $errors = New-Object System.Collections.Generic.List[string]
     $warnings = New-Object System.Collections.Generic.List[string]
 
+    $rulesForPriorityValidation = @(
+        $Rules | Where-Object { -not ($_.PSObject.Properties.Name -contains 'DesiredAction') -or $_.DesiredAction -ne 'Remove' }
+    )
+
     $duplicatePriorities = @(
-        $Rules |
+        $rulesForPriorityValidation |
         Group-Object -Property { '{0}|{1}' -f $_.Direction, $_.Priority } |
         Where-Object { $_.Count -gt 1 }
     )
@@ -1461,7 +1538,11 @@ function Test-DesiredRules {
         $errors.Add("Duplicate rule name '$($group.Name)': $details")
     }
 
-    $overlapFindings = @(Get-OverlapFindings -Rules $Rules)
+    $rulesForOverlapValidation = @(
+        $Rules | Where-Object { -not ($_.PSObject.Properties.Name -contains 'DesiredAction') -or $_.DesiredAction -ne 'Remove' }
+    )
+
+    $overlapFindings = @(Get-OverlapFindings -Rules $rulesForOverlapValidation)
     foreach ($finding in $overlapFindings) {
         $warnings.Add($finding.Message)
     }
@@ -1484,6 +1565,7 @@ function New-PlannedRule {
     return [pscustomobject]@{
         SourceSheet                 = $Rule.SourceSheet
         OriginalRow                 = $Rule.OriginalRow
+        DesiredAction               = if ($Rule.PSObject.Properties.Name -contains 'DesiredAction') { $Rule.DesiredAction } else { 'Upsert' }
         Priority                    = $Rule.Priority
         Name                        = $Rule.Name
         Direction                   = $Rule.Direction
@@ -1530,6 +1612,33 @@ function New-ApplyPlan {
     }
 
     foreach ($desired in $DesiredRules) {
+        if (($desired.PSObject.Properties.Name -contains 'DesiredAction') -and $desired.DesiredAction -eq 'Remove') {
+            if ($liveByName.ContainsKey($desired.Name)) {
+                $live = $liveByName[$desired.Name]
+
+                $plan.Add([pscustomobject]@{
+                    Action   = 'Remove'
+                    Name     = $desired.Name
+                    Priority = $live.Priority
+                    Desired  = $null
+                    Live     = $live
+                    Reason   = "Workbook Action is Remove. Existing NSG rule '$($desired.Name)' will be deleted."
+                })
+            }
+            else {
+                $plan.Add([pscustomobject]@{
+                    Action   = 'NoChange'
+                    Name     = $desired.Name
+                    Priority = $desired.Priority
+                    Desired  = $null
+                    Live     = $null
+                    Reason   = "Workbook Action is Remove, but rule '$($desired.Name)' does not exist in target NSG."
+                })
+            }
+
+            continue
+        }
+
         $desiredDirectionKey = ([string]$desired.Direction).Trim().ToUpperInvariant()
         $priorityKey = '{0}|{1}' -f $desiredDirectionKey, $desired.Priority
 
@@ -1771,6 +1880,26 @@ function Invoke-NsgRuleUpdate {
 }
 
 
+function Invoke-NsgRuleDelete {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuleName,
+        [Parameter(Mandatory = $true)][string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)][string]$NsgName,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5
+    )
+
+    [void](Invoke-AzCommandText -Arguments @(
+        'network', 'nsg', 'rule', 'delete',
+        '--resource-group', $ResourceGroupName,
+        '--nsg-name', $NsgName,
+        '--name', $RuleName,
+        '--only-show-errors'
+    ) -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -OperationName "az network nsg rule delete $RuleName")
+}
+
+
 function Invoke-NsgRuleWaitCreated {
     [CmdletBinding()]
     param(
@@ -1838,6 +1967,20 @@ function Invoke-CreateRule {
     [void](Invoke-NsgRuleCreate -Rule $DesiredRule -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds)
     Invoke-NsgRuleWaitCreated -RuleName $DesiredRule.Name -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
 }
+
+function Invoke-RemoveRule {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuleName,
+        [Parameter(Mandatory = $true)][string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)][string]$NsgName,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5
+    )
+
+    Invoke-NsgRuleDelete -RuleName $RuleName -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+}
+
 
 function Assert-AppliedRuleMatchesDesired {
     [CmdletBinding()]
@@ -1910,6 +2053,10 @@ function Invoke-ApplyPlan {
                 $executionEntry.After = $afterView
                 $executionEntry.Changes = @(Compare-RuleForCheckpoint -Before $null -After $afterView)
             }
+            'Remove' {
+                $executionEntry.Before = $beforeView
+                $executionEntry.Changes = @(Compare-RuleForCheckpoint -Before $beforeView -After $null)
+            }
             'SkipApply' {
                 if ($null -ne $beforeView) {
                     $executionEntry.Before = $beforeView
@@ -1960,11 +2107,12 @@ function Invoke-ApplyPlan {
             continue
         }
 
-        $actionText = if ($item.Action -eq 'Create') { 'PendingCreate' } elseif ($item.Action -eq 'Update') { 'PendingUpdate' } else { $item.Action }
+        $actionText = if ($item.Action -eq 'Create') { 'PendingCreate' } elseif ($item.Action -eq 'Update') { 'PendingUpdate' } elseif ($item.Action -eq 'Remove') { 'PendingRemove' } else { $item.Action }
 
         switch ($item.Action) {
             'Create' { $color = 'Green' }
             'Update' { $color = 'Yellow' }
+            'Remove' { $color = 'Red' }
             default  { $color = 'Gray' }
         }
 
@@ -1989,6 +2137,9 @@ function Invoke-ApplyPlan {
                 'Update' {
                     Invoke-UpdateRule -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                     Assert-AppliedRuleMatchesDesired -DesiredRule $item.Desired -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
+                }
+                'Remove' {
+                    Invoke-RemoveRule -RuleName $item.Name -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
                 }
                 default {
                     throw "Unsupported planned action '$($item.Action)'"
@@ -2034,12 +2185,13 @@ function Show-PlanSummary {
     $actionLabelMap = [ordered]@{
         Create    = 'PendingCreate'
         Update    = 'PendingUpdate'
+        Remove    = 'PendingRemove'
         NoChange  = 'Unchanged'
         SkipApply = 'SkippedShadowed'
         Conflict  = 'BlockedConflict'
     }
 
-    $defaultActions = @('Create','Update','NoChange','SkipApply','Conflict')
+    $defaultActions = @('Create','Update','Remove','NoChange','SkipApply','Conflict')
     $presentActions = @($Plan | ForEach-Object { $_.Action } | Sort-Object -Unique)
     $extraActions = $presentActions | Where-Object { $defaultActions -notcontains $_ }
     $allActions = $defaultActions + $extraActions
