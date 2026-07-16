@@ -33,6 +33,21 @@ Workbook sheet names to import. Defaults to CoreRules and AppRules.
 .PARAMETER Direction
 Direction applied to imported rules. Allowed values are Inbound and Outbound.
 
+.PARAMETER ApprovalYamlPath
+Path of the standalone YAML approval report.
+
+The report contains only Create and Update actions. It excludes Description changes,
+NoChange actions, shadowed rules, conflicts, and execution tracking information.
+
+.PARAMETER ReviewWorkbookPath
+Path of the reviewed workbook copy whose existing Diff column will be populated.
+
+Only Update actions are written into the Diff column. Create rows are left blank because
+the complete desired rule is already visible in the workbook row.
+
+When omitted, the script derives a reviewed workbook path from WorkbookPath.
+For example, mockData.xlsx becomes mockData.reviewed.xlsx.
+
 .PARAMETER CheckpointPath
 Base path used for checkpoint output.
 
@@ -134,6 +149,11 @@ param(
     [ValidateSet('Inbound', 'Outbound')]
     [string]$Direction = 'Inbound',
 
+    [ValidateNotNullOrEmpty()]
+    [string]$ApprovalYamlPath = './nsg-approval-report.yaml',
+
+    [string]$ReviewWorkbookPath = '',
+
     [string]$CheckpointPath = './nsg-apply-checkpoint.json',
 
     [ValidateSet('Auto', 'Overwrite', 'Timestamped', 'Both')]
@@ -160,6 +180,625 @@ $ErrorActionPreference = 'Stop'
 
 $script:AddressTokenCache = @{}
 $script:PortTokenCache = @{}
+
+$script:ApprovalDiffFields = @(
+    'Direction',
+    'Access',
+    'Protocol',
+    'SourcePortRanges',
+    'SourceAddressPrefixes',
+    'DestinationAddressPrefixes',
+    'DestinationPortRanges'
+)
+
+function ConvertTo-ApprovalValueList {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    $rawValues = @()
+
+    if ($Value -is [string]) {
+        $rawValues = @($Value)
+    }
+    elseif ($Value -is [System.Collections.IEnumerable]) {
+        $rawValues = @($Value)
+    }
+    else {
+        $rawValues = @($Value)
+    }
+
+    $result = New-Object System.Collections.Generic.List[string]
+
+    foreach ($rawValue in $rawValues) {
+        if ($null -eq $rawValue) {
+            continue
+        }
+
+        $text = [string]$rawValue
+
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+
+        $text = $text.Trim()
+
+        if ($result -notcontains $text) {
+            $result.Add($text)
+        }
+    }
+
+    return @($result.ToArray())
+}
+
+function Get-ApprovalValueDelta {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Before,
+
+        [AllowNull()]
+        [object]$After
+    )
+
+    $beforeValues = @(
+        ConvertTo-ApprovalValueList -Value $Before
+    )
+
+    $afterValues = @(
+        ConvertTo-ApprovalValueList -Value $After
+    )
+
+    $removed = New-Object System.Collections.Generic.List[string]
+    $added = New-Object System.Collections.Generic.List[string]
+
+    foreach ($beforeValue in $beforeValues) {
+        if ($afterValues -notcontains $beforeValue) {
+            $removed.Add($beforeValue)
+        }
+    }
+
+    foreach ($afterValue in $afterValues) {
+        if ($beforeValues -notcontains $afterValue) {
+            $added.Add($afterValue)
+        }
+    }
+
+    return [pscustomobject]@{
+        Removed    = @($removed.ToArray())
+        Added      = @($added.ToArray())
+        HasChanges = ($removed.Count -gt 0 -or $added.Count -gt 0)
+    }
+}
+
+function New-ApprovalFieldChange {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FieldName,
+
+        [AllowNull()]
+        [object]$Before,
+
+        [AllowNull()]
+        [object]$After
+    )
+
+    $delta = Get-ApprovalValueDelta -Before $Before -After $After
+
+    if (-not $delta.HasChanges) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Field   = $FieldName
+        Removed = @($delta.Removed)
+        Added   = @($delta.Added)
+    }
+}
+
+function Convert-PlanToApprovalChanges {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Plan
+    )
+
+    $approvalItems = New-Object System.Collections.Generic.List[object]
+
+    foreach ($planItem in @($Plan)) {
+        if ($null -eq $planItem) {
+            continue
+        }
+
+        if ($planItem.Action -notin @('Create', 'Update')) {
+            continue
+        }
+
+        if ($null -eq $planItem.Desired) {
+            throw "Cannot build approval output for rule '$($planItem.Name)'. Desired rule data is missing."
+        }
+
+        $fieldChanges = New-Object System.Collections.Generic.List[object]
+
+        foreach ($fieldName in $script:ApprovalDiffFields) {
+            $beforeValue = $null
+            $afterValue = $null
+
+            if ($planItem.Action -eq 'Update') {
+                if ($null -eq $planItem.Live) {
+                    throw "Cannot build Update approval output for rule '$($planItem.Name)'. Live rule data is missing."
+                }
+
+                $beforeProperty = $planItem.Live.PSObject.Properties[$fieldName]
+                if ($null -ne $beforeProperty) {
+                    $beforeValue = $beforeProperty.Value
+                }
+            }
+
+            $afterProperty = $planItem.Desired.PSObject.Properties[$fieldName]
+            if ($null -ne $afterProperty) {
+                $afterValue = $afterProperty.Value
+            }
+
+            $fieldChange = New-ApprovalFieldChange `
+                -FieldName $fieldName `
+                -Before $beforeValue `
+                -After $afterValue
+
+            if ($null -ne $fieldChange) {
+                $fieldChanges.Add($fieldChange)
+            }
+        }
+
+        if ($planItem.Action -eq 'Update' -and $fieldChanges.Count -eq 0) {
+            Write-Log `
+                -Level DEBUG `
+                -Message "Rule '$($planItem.Name)' is planned as Update, but no approval-visible field changes remain after excluding Description."
+
+            continue
+        }
+
+        $sourceSheet = ''
+        if ($planItem.Desired.PSObject.Properties.Name -contains 'SourceSheet') {
+            $sourceSheet = [string]$planItem.Desired.SourceSheet
+        }
+
+        $originalRow = 0
+        if ($planItem.Desired.PSObject.Properties.Name -contains 'OriginalRow') {
+            $originalRow = [int]$planItem.Desired.OriginalRow
+        }
+
+        $approvalItems.Add([pscustomobject]@{
+            Rule        = [string]$planItem.Name
+            Priority    = [int]$planItem.Priority
+            Action      = [string]$planItem.Action
+            SourceSheet = $sourceSheet
+            OriginalRow = $originalRow
+            Changes     = @($fieldChanges.ToArray())
+        })
+    }
+
+    return @(
+        $approvalItems.ToArray() |
+        Sort-Object Priority, Rule
+    )
+}
+
+function ConvertTo-YamlScalar {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return "''"
+    }
+
+    $text = ([string]$Value).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return "''"
+    }
+
+    # Escape single quotes according to YAML single-quoted scalar rules.
+    $escaped = $text.Replace("'", "''")
+
+    # Always quote values to keep output deterministic and prevent YAML from
+    # interpreting ports, wildcards, booleans, null-like values, or dates.
+    return "'$escaped'"
+}
+
+function Convert-ApprovalChangesToYaml {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$ApprovalChanges
+    )
+
+    $items = @($ApprovalChanges)
+
+    if ($items.Count -eq 0) {
+        return '[]'
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    for ($itemIndex = 0; $itemIndex -lt $items.Count; $itemIndex++) {
+        $item = $items[$itemIndex]
+
+        if ($null -eq $item) {
+            continue
+        }
+
+        if ($item.Action -notin @('Create', 'Update')) {
+            continue
+        }
+
+        if ($lines.Count -gt 0) {
+            $lines.Add('')
+        }
+
+        $lines.Add("- Rule: $(ConvertTo-YamlScalar -Value $item.Rule)")
+        $lines.Add("  Priority: $([int]$item.Priority)")
+        $lines.Add("  Action: $(ConvertTo-YamlScalar -Value $item.Action)")
+        $lines.Add('  Changes:')
+
+        $changes = @($item.Changes)
+
+        foreach ($change in $changes) {
+            if ($null -eq $change) {
+                continue
+            }
+
+            $removedValues = @(
+                ConvertTo-ApprovalValueList -Value $change.Removed
+            )
+
+            $addedValues = @(
+                ConvertTo-ApprovalValueList -Value $change.Added
+            )
+
+            if ($removedValues.Count -eq 0 -and $addedValues.Count -eq 0) {
+                continue
+            }
+
+            $lines.Add("    $($change.Field):")
+
+            if ($removedValues.Count -gt 0) {
+                $lines.Add('      Removed:')
+
+                foreach ($removedValue in $removedValues) {
+                    $yamlValue = ConvertTo-YamlScalar -Value $removedValue
+                    $lines.Add("        - $yamlValue")
+                }
+            }
+
+            if ($addedValues.Count -gt 0) {
+                $lines.Add('      Added:')
+
+                foreach ($addedValue in $addedValues) {
+                    $yamlValue = ConvertTo-YamlScalar -Value $addedValue
+                    $lines.Add("        - $yamlValue")
+                }
+            }
+        }
+    }
+
+    if ($lines.Count -eq 0) {
+        return '[]'
+    }
+
+    return ($lines.ToArray() -join [Environment]::NewLine)
+}
+
+function Save-ApprovalYaml {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$ApprovalChanges,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
+    $yamlText = Convert-ApprovalChangesToYaml `
+        -ApprovalChanges $ApprovalChanges
+
+    $parent = Split-Path -Path $Path -Parent
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($parent) -and
+        -not (Test-Path -Path $parent)
+    ) {
+        New-Item `
+            -Path $parent `
+            -ItemType Directory `
+            -Force |
+            Out-Null
+    }
+
+    Set-Content `
+        -Path $Path `
+        -Value $yamlText `
+        -Encoding UTF8
+
+    Write-Log `
+        -Level INFO `
+        -Message "Approval YAML report written to '$Path'."
+}
+
+function Resolve-ReviewWorkbookPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$WorkbookPath,
+
+        [AllowEmptyString()]
+        [string]$ReviewWorkbookPath = ''
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ReviewWorkbookPath)) {
+        return $ReviewWorkbookPath
+    }
+
+    $parent = Split-Path -Path $WorkbookPath -Parent
+    $fileName = Split-Path -Path $WorkbookPath -Leaf
+
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    $extension = [System.IO.Path]::GetExtension($fileName)
+
+    $reviewFileName = '{0}.reviewed{1}' -f $baseName, $extension
+
+    if ([string]::IsNullOrWhiteSpace($parent)) {
+        return $reviewFileName
+    }
+
+    return Join-Path -Path $parent -ChildPath $reviewFileName
+}
+
+function Convert-ApprovalItemToExcelDiff {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$ApprovalItem
+    )
+
+    if ($ApprovalItem.Action -ne 'Update') {
+        return ''
+    }
+
+    $changes = @($ApprovalItem.Changes)
+
+    if ($changes.Count -eq 0) {
+        return ''
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    $lines.Add('Action: Update')
+    $lines.Add('Changes:')
+
+    foreach ($change in $changes) {
+        if ($null -eq $change) {
+            continue
+        }
+
+        $removedValues = @(
+            ConvertTo-ApprovalValueList -Value $change.Removed
+        )
+
+        $addedValues = @(
+            ConvertTo-ApprovalValueList -Value $change.Added
+        )
+
+        if ($removedValues.Count -eq 0 -and $addedValues.Count -eq 0) {
+            continue
+        }
+
+        $lines.Add("  $($change.Field):")
+
+        if ($removedValues.Count -gt 0) {
+            $lines.Add('    Removed:')
+
+            foreach ($removedValue in $removedValues) {
+                $yamlValue = ConvertTo-YamlScalar -Value $removedValue
+                $lines.Add("      - $yamlValue")
+            }
+        }
+
+        if ($addedValues.Count -gt 0) {
+            $lines.Add('    Added:')
+
+            foreach ($addedValue in $addedValues) {
+                $yamlValue = ConvertTo-YamlScalar -Value $addedValue
+                $lines.Add("      - $yamlValue")
+            }
+        }
+    }
+
+    if ($lines.Count -le 2) {
+        return ''
+    }
+
+    return ($lines.ToArray() -join [Environment]::NewLine)
+}
+
+function Set-WorkbookApprovalDiff {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$WorkbookPath,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutputPath,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$ApprovalChanges,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$SheetNames
+    )
+
+    if (-not (Test-Path -Path $WorkbookPath -PathType Leaf)) {
+        throw "Source workbook was not found: '$WorkbookPath'."
+    }
+
+    $sourceFullPath = [System.IO.Path]::GetFullPath($WorkbookPath)
+    $outputFullPath = [System.IO.Path]::GetFullPath($OutputPath)
+
+    $outputParent = Split-Path -Path $outputFullPath -Parent
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($outputParent) -and
+        -not (Test-Path -Path $outputParent)
+    ) {
+        New-Item `
+            -Path $outputParent `
+            -ItemType Directory `
+            -Force |
+            Out-Null
+    }
+
+    # Preserve the source workbook by creating or replacing the reviewed copy.
+    if ($sourceFullPath -ine $outputFullPath) {
+        Copy-Item `
+            -Path $sourceFullPath `
+            -Destination $outputFullPath `
+            -Force
+    }
+
+    $package = $null
+
+    try {
+        $package = Open-ExcelPackage -Path $outputFullPath
+
+        foreach ($sheetName in $SheetNames) {
+            $worksheet = $package.Workbook.Worksheets[$sheetName]
+
+            if ($null -eq $worksheet) {
+                throw "Worksheet '$sheetName' was not found in reviewed workbook '$outputFullPath'."
+            }
+
+            if ($null -eq $worksheet.Dimension) {
+                throw "Worksheet '$sheetName' is empty."
+            }
+
+            $diffColumnNumber = 0
+
+            for (
+                $columnNumber = 1;
+                $columnNumber -le $worksheet.Dimension.End.Column;
+                $columnNumber++
+            ) {
+                $headerText = [string]$worksheet.Cells[1, $columnNumber].Text
+
+                if ($headerText.Trim() -ieq 'Diff') {
+                    $diffColumnNumber = $columnNumber
+                    break
+                }
+            }
+
+            if ($diffColumnNumber -eq 0) {
+                throw "Worksheet '$sheetName' does not contain the required 'Diff' column."
+            }
+
+            # Clear previously generated Diff content from all data rows.
+            if ($worksheet.Dimension.End.Row -ge 2) {
+                for (
+                    $rowNumber = 2;
+                    $rowNumber -le $worksheet.Dimension.End.Row;
+                    $rowNumber++
+                ) {
+                    $worksheet.Cells[$rowNumber, $diffColumnNumber].Value = $null
+                }
+            }
+        }
+
+        $updateItems = @(
+            $ApprovalChanges |
+            Where-Object { $_.Action -eq 'Update' }
+        )
+
+        foreach ($approvalItem in $updateItems) {
+            if ([string]::IsNullOrWhiteSpace([string]$approvalItem.SourceSheet)) {
+                throw "Cannot write Excel diff for rule '$($approvalItem.Rule)'. SourceSheet is missing."
+            }
+
+            if ([int]$approvalItem.OriginalRow -lt 2) {
+                throw "Cannot write Excel diff for rule '$($approvalItem.Rule)'. OriginalRow '$($approvalItem.OriginalRow)' is invalid."
+            }
+
+            $worksheet = $package.Workbook.Worksheets[$approvalItem.SourceSheet]
+
+            if ($null -eq $worksheet) {
+                throw "Cannot write Excel diff for rule '$($approvalItem.Rule)'. Worksheet '$($approvalItem.SourceSheet)' was not found."
+            }
+
+            $diffColumnNumber = 0
+
+            for (
+                $columnNumber = 1;
+                $columnNumber -le $worksheet.Dimension.End.Column;
+                $columnNumber++
+            ) {
+                $headerText = [string]$worksheet.Cells[1, $columnNumber].Text
+
+                if ($headerText.Trim() -ieq 'Diff') {
+                    $diffColumnNumber = $columnNumber
+                    break
+                }
+            }
+
+            if ($diffColumnNumber -eq 0) {
+                throw "Worksheet '$($approvalItem.SourceSheet)' does not contain the required 'Diff' column."
+            }
+
+            $cellText = Convert-ApprovalItemToExcelDiff `
+                -ApprovalItem $approvalItem
+
+            if ([string]::IsNullOrWhiteSpace($cellText)) {
+                continue
+            }
+
+            $targetRow = [int]$approvalItem.OriginalRow
+            $targetCell = $worksheet.Cells[$targetRow, $diffColumnNumber]
+
+            $targetCell.Value = $cellText
+            $targetCell.Style.WrapText = $true
+            $targetCell.Style.VerticalAlignment = 'Top'
+        }
+
+        $package.Save()
+    }
+    finally {
+        if ($null -ne $package) {
+            $package.Dispose()
+        }
+    }
+
+    Write-Log `
+        -Level INFO `
+        -Message "Reviewed workbook written to '$outputFullPath'."
+
+    return $outputFullPath
+}
 
 function Write-Log {
     [CmdletBinding()]
@@ -2106,6 +2745,20 @@ if ($conflicts.Count -gt 0) {
     Write-Log -Message "Priority collision conflict(s) detected: $details" -Level ERROR
     throw "Priority collision(s) detected. Resolve the conflicting priorities and re-run the script. Conflicts: $details"
 }
+
+$approvalChanges = Convert-PlanToApprovalChanges -Plan $plan
+Save-ApprovalYaml -ApprovalChanges $approvalChanges -Path $ApprovalYamlPath
+
+$resolvedReviewWorkbookPath = Resolve-ReviewWorkbookPath `
+    -WorkbookPath $WorkbookPath `
+    -ReviewWorkbookPath $ReviewWorkbookPath
+
+$resolvedReviewWorkbookPath = Set-WorkbookApprovalDiff `
+    -WorkbookPath $WorkbookPath `
+    -OutputPath $resolvedReviewWorkbookPath `
+    -ApprovalChanges $approvalChanges `
+    -SheetNames $SheetNames
+
 
 $checkpointTargets = Resolve-CheckpointTargets -CheckpointPath $CheckpointPath -CheckpointMode $CheckpointMode -Apply:$Apply
 Write-Log -Message "Checkpoint mode '$($checkpointTargets.EffectiveMode)' using run file '$($checkpointTargets.RunPath)'" -Level INFO
