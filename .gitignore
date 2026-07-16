@@ -2,6 +2,8 @@
 /nsg-apply-checkpoint.json
 /nsg-apply-checkpoint-*.json
 /live-rules.json
+/nsg-approval-report.yaml
+/*.reviewed.xlsx
 
 # Local Office temp files
 ~$*.xlsx
