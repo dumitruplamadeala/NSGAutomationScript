@@ -387,30 +387,11 @@ def write_dict_to_row(
             continue
 
         # Additional Comments
-        if is_update and key == COL_ADDITIONAL and row.get("_added_comment"):
-
-            full_comment = normalize_scalar(row.get(COL_ADDITIONAL))
-            added_comment = normalize_scalar(row.get("_added_comment"))
-
-            if added_comment and added_comment in full_comment:
-
-                rich = CellRichText()
-
-                pos = full_comment.rfind(added_comment)
-
-                before = full_comment[:pos]
-                after = full_comment[pos + len(added_comment) :]
-
-                if before:
-                    rich.append(before)
-
-                rich.append(TextBlock(InlineFont(b=True), added_comment))
-
-                if after:
-                    rich.append(after)
-
-                ws.cell(row_idx, col).value = rich
-                continue
+        if is_update and key == COL_ADDITIONAL and row.get("_added_comments"):
+            ws.cell(row_idx, col).value = build_rich_text_comments(
+                row.get(COL_ADDITIONAL), row.get("_added_comments")
+            )
+            continue
 
         # Default behavior (unchanged)
         ws.cell(row_idx, col).value = row.get(key)
@@ -521,13 +502,18 @@ def merge_existing_rule(
     )
 
     # Additional Comments
-    new_comment = normalize_scalar(diff_row.get(COL_ADDITIONAL))
-
     updated[COL_ADDITIONAL] = merge_additional_comments(
         updated.get(COL_ADDITIONAL), diff_row.get(COL_ADDITIONAL)
     )
-
-    updated["_added_comment"] = new_comment
+    existing_comment_keys = {
+        additional_comment_key(entry)
+        for entry in split_additional_comment_entries(base_row.get(COL_ADDITIONAL))
+    }
+    updated["_added_comments"] = [
+        entry
+        for entry in split_additional_comment_entries(diff_row.get(COL_ADDITIONAL))
+        if additional_comment_key(entry) not in existing_comment_keys
+    ]
 
     # Only real traffic/source changes trigger Update
     has_real_update = (
@@ -895,6 +881,58 @@ def build_rich_text_list(
     return rich
 
 
+def split_additional_comment_entries(value: Any) -> List[str]:
+    text = normalize_scalar(value)
+    if not text:
+        return []
+
+    entry_start = (
+        r"(?:CI\d+\b|IPR\d+\b|"
+        r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d+)?\b|"
+        r"[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\b)"
+    )
+    parts = re.split(rf"(?:[\r\n]+|[,;]\s*)(?={entry_start})", text, flags=re.I)
+    return [part.strip(" ,;") for part in parts if part.strip(" ,;")]
+
+
+def additional_comment_key(entry: str) -> str:
+    match = re.match(r"^\s*(CI\d+)\b", entry, re.I)
+    if match:
+        return match.group(1).upper()
+
+    match = re.match(r"^\s*(IPR\d+)\b", entry, re.I)
+    if match:
+        return match.group(1).upper()
+
+    match = re.match(r"^\s*((?:\d{1,3}\.){3}\d{1,3}(?:/\d+)?)", entry)
+    if match:
+        return match.group(1)
+
+    match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})\b", entry)
+    if match:
+        return match.group(1).lower()
+
+    match = re.match(r"^\s*(OneCloud Subnet.*)$", entry, re.I)
+    if match:
+        return match.group(1).lower()
+
+    return entry.lower()
+
+
+def build_rich_text_comments(full_value: Any, added_entries: Sequence[str]):
+    added_keys = {additional_comment_key(entry) for entry in added_entries}
+    rich = CellRichText()
+    entries = split_additional_comment_entries(full_value)
+    for index, entry in enumerate(entries):
+        if index:
+            rich.append("\n")
+        if additional_comment_key(entry) in added_keys:
+            rich.append(TextBlock(InlineFont(b=True), entry))
+        else:
+            rich.append(entry)
+    return rich
+
+
 def merge_additional_comments(existing: Any, incoming: Any) -> str:
     """
     Merge Additional Comments.
@@ -903,46 +941,6 @@ def merge_additional_comments(existing: Any, incoming: Any) -> str:
     If one version contains ASPIED information, keep that one.
     Otherwise keep the longest version.
     """
-
-    def split_entries(value: Any) -> List[str]:
-        text = normalize_scalar(value)
-        if not text:
-            return []
-
-        # Comments may use newlines, commas, or semicolons. Split only when
-        # the next segment starts a recognizable entry, so punctuation inside
-        # ordinary prose remains intact.
-        entry_start = (
-            r"(?:CI\d+\b|IPR\d+\b|"
-            r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d+)?\b|"
-            r"[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\b)"
-        )
-        parts = re.split(rf"(?:[\r\n]+|[,;]\s*)(?={entry_start})", text, flags=re.I)
-        return [part.strip(" ,;") for part in parts if part.strip(" ,;")]
-
-    def get_key(entry: str) -> str:
-
-        m = re.match(r"^\s*(CI\d+)\b", entry, re.I)
-        if m:
-            return m.group(1).upper()
-
-        m = re.match(r"^\s*(IPR\d+)\b", entry, re.I)
-        if m:
-            return m.group(1).upper()
-
-        m = re.match(r"^\s*((?:\d{1,3}\.){3}\d{1,3}(?:/\d+)?)", entry)
-        if m:
-            return m.group(1)
-
-        m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})\b", entry)
-        if m:
-            return m.group(1).lower()
-
-        m = re.match(r"^\s*(OneCloud Subnet.*)$", entry, re.I)
-        if m:
-            return m.group(1).lower()
-
-        return entry.lower()
 
     def score(entry: str) -> int:
 
@@ -958,16 +956,16 @@ def merge_additional_comments(existing: Any, incoming: Any) -> str:
 
     merged = {}
 
-    for entry in split_entries(existing):
-        key = get_key(entry)
+    for entry in split_additional_comment_entries(existing):
+        key = additional_comment_key(entry)
 
         if key not in merged:
             merged[key] = entry
         elif score(entry) > score(merged[key]):
             merged[key] = entry
 
-    for entry in split_entries(incoming):
-        key = get_key(entry)
+    for entry in split_additional_comment_entries(incoming):
+        key = additional_comment_key(entry)
 
         if key not in merged:
             merged[key] = entry
@@ -999,3 +997,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
