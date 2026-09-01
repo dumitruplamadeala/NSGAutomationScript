@@ -47,6 +47,20 @@ Required workbook headers:
 - `Destination IP address / Subnet / Range IP`
 - `Destination Port or Service`
 
+### Pipeline filename convention
+
+`-ResourceGroupName` and `-NsgName` can be omitted when the workbook filename follows:
+
+```text
+<resource-group>__<nsg-name>_NetworkAccessRequest_v<digits>.xlsx
+```
+
+Example: `NSG-test-script__nsg-ci-automation-app_NetworkAccessRequest_v1.xlsx`
+
+The double underscore separates the resource group from the NSG name. The numeric suffix is required for filename validation but is not read or used as a version by the script. Explicit `-ResourceGroupName` and `-NsgName` values take precedence over values in the filename.
+
+`-Description` is also optional and defaults to `Generated for review only`.
+
 ## Main behavior
 
 ### Dry-run
@@ -127,6 +141,15 @@ This is useful when you want both history and a predictable latest file.
 
 ## Common commands
 
+### Pipeline-friendly dry-run
+
+```powershell
+.\apply_nsg_rules.ps1 `
+  -WorkbookPath .\NSG-test-script__nsg-ci-automation-app_NetworkAccessRequest_v1.xlsx
+```
+
+This resolves the resource group and NSG from the filename and uses the default review-only description.
+
 ### Dry-run
 
 ```powershell
@@ -175,8 +198,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ## Important parameters
 
 - `-WorkbookPath`: source Excel file
-- `-ResourceGroupName`: target Azure resource group
-- `-NsgName`: target NSG name
+- `-ResourceGroupName`: target Azure resource group; optional with the pipeline filename convention
+- `-NsgName`: target NSG name; optional with the pipeline filename convention
 - `-SheetNames`: source worksheets, default `CoreRules`, `AppRules`
 - `-Direction`: `Inbound` or `Outbound`
 - `-CheckpointPath`: base checkpoint file path
@@ -187,7 +210,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 - `-PassThru`: emit execution objects to the pipeline
 - `-RetryCount`: retry attempts for Azure CLI calls
 - `-RetryDelaySeconds`: delay between retries
-- `-Description`: managed rule description text
+- `-Description`: managed rule description text; defaults to `Generated for review only`
 
 ## Notes for operators
 

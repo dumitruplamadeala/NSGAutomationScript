@@ -22,10 +22,13 @@ High-level flow:
 Path to the Excel workbook that contains the desired NSG rules.
 
 .PARAMETER ResourceGroupName
-Azure resource group that contains the target NSG.
+Azure resource group that contains the target NSG. When omitted, it is read from WorkbookPath.
 
 .PARAMETER NsgName
-Name of the target Network Security Group.
+Name of the target Network Security Group. When omitted, it is read from WorkbookPath.
+
+The expected workbook filename is <resource-group>__<nsg-name>_NetworkAccessRequest_v<digits>.xlsx.
+The numeric suffix is validated as part of the naming convention but is not used by the script.
 
 .PARAMETER SheetNames
 Workbook sheet names to import. Defaults to CoreRules and AppRules.
@@ -90,6 +93,7 @@ Delay between Azure CLI retry attempts.
 .PARAMETER Description
 Managed description applied to new rules and appended to existing Azure descriptions when a rule update is required.
 Expected format: RITMxxxx - NYxxxx - mm/dd/yyyy - Create|Update
+Defaults to "Generated for review only" when omitted.
 
 .EXAMPLE
 .\v5apply_nsg_rules.ps1 `
@@ -136,13 +140,11 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$WorkbookPath,
 
-    [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
-    [string]$ResourceGroupName,
+    [string]$ResourceGroupName = '',
 
-    [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
-    [string]$NsgName,
+    [string]$NsgName = '',
 
     [string[]]$SheetNames = @('CoreRules', 'AppRules'),
 
@@ -170,9 +172,8 @@ param(
     [ValidateRange(1, 300)]
     [int]$RetryDelaySeconds = 5,
 
-    [Parameter(Mandatory = $true)]
     [ValidateLength(1, 140)]
-    [string]$Description
+    [string]$Description = 'Generated for review only'
 )
 
 Set-StrictMode -Version Latest
@@ -2770,9 +2771,53 @@ function Invoke-Preflight {
     ) -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -OperationName 'az network nsg show')
 }
 
+function Resolve-NsgTarget {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkbookPath,
+        [AllowEmptyString()][string]$ResourceGroupName,
+        [AllowEmptyString()][string]$NsgName
+    )
+
+    $resolvedResourceGroupName = $ResourceGroupName
+    $resolvedNsgName = $NsgName
+
+    if ([string]::IsNullOrWhiteSpace($resolvedResourceGroupName) -or [string]::IsNullOrWhiteSpace($resolvedNsgName)) {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($WorkbookPath)
+        $pattern = '^(?<ResourceGroupName>.+)__(?<NsgName>.+)_NetworkAccessRequest_v\d+$'
+
+        if ($baseName -notmatch $pattern) {
+            throw "ResourceGroupName or NsgName was not provided. Use explicit parameters or name the workbook '<resource-group>__<nsg-name>_NetworkAccessRequest_v<digits>.xlsx'. Actual filename: '$([System.IO.Path]::GetFileName($WorkbookPath))'."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedResourceGroupName)) {
+            $resolvedResourceGroupName = $Matches.ResourceGroupName
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedNsgName)) {
+            $resolvedNsgName = $Matches.NsgName
+        }
+    }
+
+    return [pscustomobject]@{
+        ResourceGroupName = $resolvedResourceGroupName
+        NsgName           = $resolvedNsgName
+    }
+}
+
 if (-not (Test-Path -Path $WorkbookPath -PathType Leaf)) {
     throw "Workbook not found: $WorkbookPath"
 }
+
+$resolvedTarget = Resolve-NsgTarget `
+    -WorkbookPath $WorkbookPath `
+    -ResourceGroupName $ResourceGroupName `
+    -NsgName $NsgName
+
+$ResourceGroupName = $resolvedTarget.ResourceGroupName
+$NsgName = $resolvedTarget.NsgName
+
+Write-Log -Message "Resolved NSG target: resource group '$ResourceGroupName', NSG '$NsgName'." -Level INFO
 
 if (-not $SkipPreflight) {
     Invoke-Preflight -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
