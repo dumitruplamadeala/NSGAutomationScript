@@ -1186,7 +1186,14 @@ function Test-ValidCidr {
     $mask = [int]$Matches[2]
 
     if (-not (Test-ValidIpv4 -Value $ipPart)) { return $false }
-    return $mask -ge 0 -and $mask -le 32
+    if ($mask -lt 0 -or $mask -gt 32) { return $false }
+
+    $address = Convert-Ipv4ToUInt32 -Value $ipPart
+    $binary = [Convert]::ToString($address, 2).PadLeft(32, '0')
+    $prefix = if ($mask -eq 0) { '' } else { $binary.Substring(0, $mask) }
+    $networkAddress = [Convert]::ToUInt32($prefix.PadRight(32, '0'), 2)
+
+    return $address -eq $networkAddress
 }
 
 function Convert-Ipv4ToUInt32 {
@@ -1285,7 +1292,6 @@ function Test-ValidIpOrCidrOrRangeOrWildcardOrServiceTag {
     if ($Value -eq '*') { return $true }
     if (Test-ValidIpv4 -Value $Value) { return $true }
     if (Test-ValidCidr -Value $Value) { return $true }
-    if (Test-ValidIpv4Range -Value $Value) { return $true }
     if (Test-ValidServiceTag -Value $Value) { return $true }
 
     return $false
@@ -1301,18 +1307,41 @@ function Normalize-AddressPrefixes {
         $candidate = ($token -replace '\s*-\s*', '-').Trim()
 
         if (-not (Test-ValidIpOrCidrOrRangeOrWildcardOrServiceTag -Value $candidate)) {
-            throw "Invalid address token '$token'. Allowed values: explicit '*', IPv4, CIDR, IPv4 range, or supported service tags."
+            throw "Invalid address token '$token'. Allowed values: explicit '*', IPv4, CIDR"
         }
 
         if ($candidate -ne '*' -and (Test-ValidServiceTag -Value $candidate)) {
             $candidate = Get-CanonicalServiceTag -Value $candidate
         }
 
+        if (Test-ValidIpv4 -Value $candidate) {
+            $candidate = "$candidate/32"
+        }
+
         $candidate
     }
 
     if ($normalized -contains '*') { return @('*') }
-    return @($normalized | Sort-Object -Unique)
+
+    $normalized = @($normalized | Sort-Object -Unique)
+
+    for ($currentIndex = 0; $currentIndex -lt $normalized.Count; $currentIndex++) {
+        $current = Parse-AddressToken -Token $normalized[$currentIndex]
+
+        for ($previousIndex = 0; $previousIndex -lt $currentIndex; $previousIndex++) {
+            $previous = Parse-AddressToken -Token $normalized[$previousIndex]
+
+            if (Test-AddressTokenCovers -Previous $previous -Current $current) {
+                throw "Invalid address definition. Overlap detected: '$($current.Raw)' is covered by '$($previous.Raw)'."
+            }
+
+            if (Test-AddressTokenCovers -Previous $current -Current $previous) {
+                throw "Invalid address definition. Overlap detected: '$($previous.Raw)' is covered by '$($current.Raw)'."
+            }
+        }
+    }
+
+    return @($normalized)
 }
 
 function Normalize-Protocol {
