@@ -40,6 +40,7 @@ By default, the script reads these worksheets:
 
 Required workbook headers:
 
+- `Action`
 - `Rule Name`
 - `Rule Number`
 - `Destination Protocol`
@@ -47,21 +48,52 @@ Required workbook headers:
 - `Destination IP address / Subnet / Range IP`
 - `Destination Port or Service`
 
+Allowed `Action` values are `Create`, `Update`, `Remove`, and `No-Change`.
+
 ### Pipeline filename convention
 
 `-ResourceGroupName` and `-NsgName` can be omitted when the workbook filename follows:
 
 ```text
-<resource-group>__<nsg-name>_NetworkAccessRequest_v<digits>.xlsx
+<resource-group>__<nsg-name>_NetworkAccessRequest_v<number[.number...]>.xlsx
 ```
 
-Example: `NSG-test-script__nsg-ci-automation-app_NetworkAccessRequest_v1.xlsx`
+Examples:
 
-The double underscore separates the resource group from the NSG name. The numeric suffix is required for filename validation but is not read or used as a version by the script. Explicit `-ResourceGroupName` and `-NsgName` values take precedence over values in the filename.
+- `NSG-test-script__nsg-ci-automation-app_NetworkAccessRequest_v1.xlsx`
+- `NSG-test-script__nsg-ci-automation-app_NetworkAccessRequest_v0.1.xlsx`
+- `NSG-test-script__nsg-ci-automation-app_NetworkAccessRequest_v1.2.3.xlsx`
+
+The double underscore separates the resource group from the NSG name. The version suffix must contain one or more dot-separated numeric components. It is validated as part of the filename but is not otherwise read or used by the script. Explicit `-ResourceGroupName` and `-NsgName` values take precedence over values in the filename.
 
 `-Description` is also optional and defaults to `Generated for review only`.
 
 ## Main behavior
+
+### Action reconciliation
+
+The source workbook's `Action` value is retained as requested intent. The reviewed workbook updates it from the live NSG comparison:
+
+| Live Azure state | Reviewed workbook `Action` |
+| --- | --- |
+| Rule is absent | `Create` |
+| Matching Allow rule is identical | `No-Change` |
+| Matching Allow rule differs | `Update` |
+| Matching rule has Azure `Access` set to `Deny` | `Remove` |
+
+`Remove` is reporting only. The script does not delete Azure rules, including when `-Apply` is used.
+
+### Unmanaged NSG rules
+
+A live Azure rule is reported as `Unmanaged` when its normalized direction and priority are not present in the workbook. Same-priority rules with a different name remain conflicts rather than unmanaged findings.
+
+Unmanaged rules are:
+
+- logged as warnings
+- included in the approval YAML with their live name, priority, direction, access, and protocol
+- included in checkpoint metadata under `UnmanagedNsgRules`
+
+Unmanaged findings are informational and never cause an Azure change.
 
 ### Dry-run
 
@@ -92,6 +124,7 @@ Checkpoint files are execution and audit records. They are not used to resume pa
 Execution status values:
 
 - `Unchanged`: planned action was `NoChange`
+- `ReportedRemove`: a matching live Deny rule was mapped to workbook action `Remove`
 - `SkippedShadowed`: planned action was `SkipApply` due to overlap/shadowing detection
 - `BlockedConflict`: planned action was `Conflict`
 - `Pending`: planned `Create` or `Update` that was not executed yet (for example dry-run)
@@ -103,6 +136,7 @@ Action-specific payload behavior:
 - `NoChange`: minimal record only
 - `Create`: includes `After` and `Changes`
 - `Update`: includes `Before`, `After`, and `Changes`
+- `Remove`: includes `Before` and `Changes`; reporting only
 - `SkipApply`: includes `After`, and includes `Before` when the skipped item would have been an update
 - `Conflict`: includes `Before`, `After`, and `Changes`
 
@@ -215,6 +249,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ## Notes for operators
 
 - `NoChange` means the live rule fingerprint already matches the desired state.
+- `Remove` means the matching Azure rule has `Access` set to `Deny`; it does not delete the rule.
+- `Unmanaged` means no workbook rule has the same normalized direction and priority.
 - `Conflict` means the same priority already exists with a different rule name.
 - Overlap warnings do not stop execution unless `-FailOnShadowing` is used.
 - Shadowed rules are logged as `SkippedShadowed` and are not sent to Azure.

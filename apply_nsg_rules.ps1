@@ -27,7 +27,7 @@ Azure resource group that contains the target NSG. When omitted, it is read from
 .PARAMETER NsgName
 Name of the target Network Security Group. When omitted, it is read from WorkbookPath.
 
-The expected workbook filename is <resource-group>__<nsg-name>_NetworkAccessRequest_v<digits>.xlsx.
+The expected workbook filename starts with <resource-group>__<nsg-name>_NetworkAccessRequest_v<number[.number...]> and may include additional dot suffixes before .xlsx.
 The numeric suffix is validated as part of the naming convention but is not used by the script.
 
 .PARAMETER SheetNames
@@ -39,14 +39,16 @@ Direction applied to imported rules. Allowed values are Inbound and Outbound.
 .PARAMETER ApprovalYamlPath
 Path of the standalone YAML approval report.
 
-The report contains only Create and Update actions. It excludes Description changes,
+The report contains Create, Update, and reporting-only Remove actions, plus live Azure rules
+whose direction and priority are absent from the workbook. It excludes Description changes,
 NoChange actions, shadowed rules, conflicts, and execution tracking information.
 
 .PARAMETER ReviewWorkbookPath
 Path of the reviewed workbook copy whose existing Diff column will be populated.
 
-Only Update actions are written into the Diff column. Create rows are left blank because
-the complete desired rule is already visible in the workbook row.
+The Action column is reconciled to Create, Update, Remove, or No-Change. Only Update actions
+are written into the Diff column. Create rows are left blank because the complete desired
+rule is already visible in the workbook row.
 
 When omitted, the script derives a reviewed workbook path from WorkbookPath.
 For example, mockData.xlsx becomes mockData.reviewed.xlsx.
@@ -319,7 +321,7 @@ function Convert-PlanToApprovalChanges {
             continue
         }
 
-        if ($planItem.Action -notin @('Create', 'Update')) {
+        if ($planItem.Action -notin @('Create', 'Update', 'Remove')) {
             continue
         }
 
@@ -333,9 +335,9 @@ function Convert-PlanToApprovalChanges {
             $beforeValue = $null
             $afterValue = $null
 
-            if ($planItem.Action -eq 'Update') {
+            if ($planItem.Action -in @('Update', 'Remove')) {
                 if ($null -eq $planItem.Live) {
-                    throw "Cannot build Update approval output for rule '$($planItem.Name)'. Live rule data is missing."
+                    throw "Cannot build $($planItem.Action) approval output for rule '$($planItem.Name)'. Live rule data is missing."
                 }
 
                 $beforeProperty = $planItem.Live.PSObject.Properties[$fieldName]
@@ -344,9 +346,11 @@ function Convert-PlanToApprovalChanges {
                 }
             }
 
-            $afterProperty = $planItem.Desired.PSObject.Properties[$fieldName]
-            if ($null -ne $afterProperty) {
-                $afterValue = $afterProperty.Value
+            if ($planItem.Action -ne 'Remove') {
+                $afterProperty = $planItem.Desired.PSObject.Properties[$fieldName]
+                if ($null -ne $afterProperty) {
+                    $afterValue = $afterProperty.Value
+                }
             }
 
             $fieldChange = New-ApprovalFieldChange `
@@ -423,12 +427,16 @@ function Convert-ApprovalChangesToYaml {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
-        [object[]]$ApprovalChanges
+        [object[]]$ApprovalChanges,
+
+        [AllowEmptyCollection()]
+        [object[]]$UnmanagedNsgRules = @()
     )
 
     $items = @($ApprovalChanges)
+    $unmanagedItems = @($UnmanagedNsgRules)
 
-    if ($items.Count -eq 0) {
+    if ($items.Count -eq 0 -and $unmanagedItems.Count -eq 0) {
         return '[]'
     }
 
@@ -441,7 +449,7 @@ function Convert-ApprovalChangesToYaml {
             continue
         }
 
-        if ($item.Action -notin @('Create', 'Update')) {
+        if ($item.Action -notin @('Create', 'Update', 'Remove')) {
             continue
         }
 
@@ -495,6 +503,20 @@ function Convert-ApprovalChangesToYaml {
         }
     }
 
+    foreach ($unmanagedItem in $unmanagedItems) {
+        if ($lines.Count -gt 0) {
+            $lines.Add('')
+        }
+
+        $lines.Add("- Rule: $(ConvertTo-YamlScalar -Value $unmanagedItem.Name)")
+        $lines.Add("  Priority: $([int]$unmanagedItem.Priority)")
+        $lines.Add("  Action: 'Unmanaged'")
+        $lines.Add("  Direction: $(ConvertTo-YamlScalar -Value $unmanagedItem.Direction)")
+        $lines.Add("  Access: $(ConvertTo-YamlScalar -Value $unmanagedItem.Access)")
+        $lines.Add("  Protocol: $(ConvertTo-YamlScalar -Value $unmanagedItem.Protocol)")
+        $lines.Add("  Reason: $(ConvertTo-YamlScalar -Value $unmanagedItem.Reason)")
+    }
+
     if ($lines.Count -eq 0) {
         return '[]'
     }
@@ -509,13 +531,17 @@ function Save-ApprovalYaml {
         [AllowEmptyCollection()]
         [object[]]$ApprovalChanges,
 
+        [AllowEmptyCollection()]
+        [object[]]$UnmanagedNsgRules = @(),
+
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Path
     )
 
     $yamlText = Convert-ApprovalChangesToYaml `
-        -ApprovalChanges $ApprovalChanges
+        -ApprovalChanges $ApprovalChanges `
+        -UnmanagedNsgRules $UnmanagedNsgRules
 
     $parent = Split-Path -Path $Path -Parent
 
@@ -570,6 +596,17 @@ function Resolve-ReviewWorkbookPath {
     return Join-Path -Path $parent -ChildPath $reviewFileName
 }
 
+function ConvertTo-ExcelDiffValue {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    if ($Value -match '^(?<Address>[0-9]{1,3}(?:\.[0-9]{1,3}){3})/32$') {
+        return $Matches.Address
+    }
+
+    return $Value
+}
+
 function Convert-ApprovalItemToExcelDiff {
     [CmdletBinding()]
     param(
@@ -615,7 +652,7 @@ function Convert-ApprovalItemToExcelDiff {
             $lines.Add('    Removed:')
 
             foreach ($removedValue in $removedValues) {
-                $yamlValue = ConvertTo-YamlScalar -Value $removedValue
+                $yamlValue = ConvertTo-YamlScalar -Value (ConvertTo-ExcelDiffValue -Value $removedValue)
                 $lines.Add("      - $yamlValue")
             }
         }
@@ -624,7 +661,7 @@ function Convert-ApprovalItemToExcelDiff {
             $lines.Add('    Added:')
 
             foreach ($addedValue in $addedValues) {
-                $yamlValue = ConvertTo-YamlScalar -Value $addedValue
+                $yamlValue = ConvertTo-YamlScalar -Value (ConvertTo-ExcelDiffValue -Value $addedValue)
                 $lines.Add("      - $yamlValue")
             }
         }
@@ -635,6 +672,28 @@ function Convert-ApprovalItemToExcelDiff {
     }
 
     return ($lines.ToArray() -join [Environment]::NewLine)
+}
+
+function Get-WorkbookActionForPlanItem {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][pscustomobject]$PlanItem)
+
+    switch ($PlanItem.Action) {
+        'Create'   { return 'Create' }
+        'Update'   { return 'Update' }
+        'Remove'   { return 'Remove' }
+        'NoChange' { return 'No-Change' }
+        default {
+            if (
+                $null -ne $PlanItem.Desired -and
+                $PlanItem.Desired.PSObject.Properties.Name -contains 'RequestedAction'
+            ) {
+                return [string]$PlanItem.Desired.RequestedAction
+            }
+
+            throw "Cannot resolve workbook Action for plan action '$($PlanItem.Action)' on rule '$($PlanItem.Name)'."
+        }
+    }
 }
 
 function Set-WorkbookApprovalDiff {
@@ -651,6 +710,10 @@ function Set-WorkbookApprovalDiff {
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
         [object[]]$ApprovalChanges,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Plan,
 
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -784,6 +847,52 @@ function Set-WorkbookApprovalDiff {
             $targetCell.Value = $cellText
             $targetCell.Style.WrapText = $true
             $targetCell.Style.VerticalAlignment = 'Top'
+        }
+
+        foreach ($planItem in $Plan) {
+            if ($null -eq $planItem.Desired) {
+                continue
+            }
+
+            $worksheet = $package.Workbook.Worksheets[$planItem.Desired.SourceSheet]
+            $actionColumnNumber = 0
+
+            for (
+                $columnNumber = 1;
+                $columnNumber -le $worksheet.Dimension.End.Column;
+                $columnNumber++
+            ) {
+                if ([string]$worksheet.Cells[1, $columnNumber].Text -ieq 'Action') {
+                    $actionColumnNumber = $columnNumber
+                    break
+                }
+            }
+
+            if ($actionColumnNumber -eq 0) {
+                throw "Worksheet '$($planItem.Desired.SourceSheet)' does not contain the required 'Action' column."
+            }
+
+            $targetRow = [int]$planItem.Desired.OriginalRow
+            $resolvedAction = Get-WorkbookActionForPlanItem -PlanItem $planItem
+            $worksheet.Cells[$targetRow, $actionColumnNumber].Value = $resolvedAction
+
+            if ($planItem.Desired.RequestedAction -eq 'Update' -and $resolvedAction -eq 'No-Change') {
+                $targetRowRange = $worksheet.Cells[$targetRow, 1, $targetRow, $worksheet.Dimension.End.Column]
+                $targetRowRange.Style.Font.Bold = $false
+                $targetRowRange.Style.Font.Color.SetColor([System.Drawing.Color]::Black)
+
+                for ($columnNumber = 1; $columnNumber -le $worksheet.Dimension.End.Column; $columnNumber++) {
+                    $targetCell = $worksheet.Cells[$targetRow, $columnNumber]
+                    if (-not $targetCell.IsRichText) {
+                        continue
+                    }
+
+                    foreach ($richTextRun in $targetCell.RichText) {
+                        $richTextRun.Bold = $false
+                        $richTextRun.Color = [System.Drawing.Color]::Black
+                    }
+                }
+            }
         }
 
         $package.Save()
@@ -1048,12 +1157,27 @@ function Get-WorkbookHeaderMap {
     param()
 
     return [ordered]@{
+        Action             = 'Action'
         RuleName           = 'Rule Name'
         RuleNumber         = 'Rule Number'
         Protocol           = 'Destination Protocol'
         SourceAddress      = 'Source IP address / Subnet / Range IP'
         DestinationAddress = 'Destination IP address / Subnet / Range IP'
         DestinationPorts   = 'Destination Port or Service'
+    }
+}
+
+function Normalize-WorkbookAction {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    switch ($Value.Trim().ToUpperInvariant()) {
+        'CREATE'    { return 'Create' }
+        'UPDATE'    { return 'Update' }
+        'REMOVE'    { return 'Remove' }
+        'NO-CHANGE' { return 'No-Change' }
+        'NOCHANGE'  { return 'No-Change' }
+        default     { throw "Invalid Action '$Value'. Allowed values: Create, Update, Remove, No-Change." }
     }
 }
 
@@ -1172,6 +1296,10 @@ function Split-NormalizedList {
 function Test-ValidIpv4 {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Value)
+
+    if ($Value -notmatch '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') {
+        return $false
+    }
 
     $ip = $null
     return [System.Net.IPAddress]::TryParse($Value, [ref]$ip) -and $ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork
@@ -1590,12 +1718,20 @@ function Convert-WorksheetRowToRule {
 
     $headers = Get-WorkbookHeaderMap
 
+    $actionRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.Action) -FieldLabel $headers.Action
     $priorityRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.RuleNumber) -FieldLabel $headers.RuleNumber
     $ruleNameRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.RuleName) -FieldLabel $headers.RuleName
     $protocolRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.Protocol) -FieldLabel $headers.Protocol
     $sourceIpRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.SourceAddress) -FieldLabel $headers.SourceAddress
     $destinationIpRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.DestinationAddress) -FieldLabel $headers.DestinationAddress
     $destinationPortRaw = Get-RequiredRowValue -Row $Row -CandidateNames @($headers.DestinationPorts) -FieldLabel $headers.DestinationPorts
+
+    try {
+        $requestedAction = Normalize-WorkbookAction -Value ([string]$actionRaw)
+    }
+    catch {
+        throw "Validation error in sheet '$SheetName', row $RowNumber, column '$($headers.Action)'. Value: '$actionRaw'. $($_.Exception.Message)"
+    }
 
     $priority = 0
     if (-not [int]::TryParse([string]$priorityRaw, [ref]$priority)) {
@@ -1651,6 +1787,7 @@ function Convert-WorksheetRowToRule {
     $rule = [pscustomobject]@{
         SourceSheet                 = $SheetName
         OriginalRow                 = $RowNumber
+        RequestedAction             = $requestedAction
         Priority                    = $priority
         Name                        = $ruleName
         Direction                   = $Direction
@@ -2153,6 +2290,7 @@ function New-PlannedRule {
     return [pscustomobject]@{
         SourceSheet                 = $Rule.SourceSheet
         OriginalRow                 = $Rule.OriginalRow
+        RequestedAction             = $Rule.RequestedAction
         Priority                    = $Rule.Priority
         Name                        = $Rule.Name
         Direction                   = $Rule.Direction
@@ -2221,6 +2359,18 @@ function New-ApplyPlan {
                 }
             }
 
+            if ([string]$live.Access -ieq 'Deny') {
+                $plan.Add([pscustomobject]@{
+                    Action   = 'Remove'
+                    Name     = $desired.Name
+                    Priority = $desired.Priority
+                    Desired  = $desired
+                    Live     = $live
+                    Reason   = 'The matching live Azure rule has Access Deny and maps to workbook Action Remove. No Azure deletion is performed.'
+                })
+                continue
+            }
+
             if ($desired.Fingerprint -eq $live.Fingerprint) {
                 $plan.Add([pscustomobject]@{
                     Action   = 'NoChange'
@@ -2276,6 +2426,40 @@ function New-ApplyPlan {
     }
 
     return @($plan | Sort-Object Priority, Name, Action)
+}
+
+function Get-UnmanagedNsgRules {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$DesiredRules,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$LiveRules
+    )
+
+    $desiredPriorities = @{}
+    foreach ($desired in $DesiredRules) {
+        $key = '{0}|{1}' -f ([string]$desired.Direction).Trim().ToUpperInvariant(), $desired.Priority
+        $desiredPriorities[$key] = $true
+    }
+
+    return @(
+        foreach ($live in $LiveRules) {
+            $key = '{0}|{1}' -f ([string]$live.Direction).Trim().ToUpperInvariant(), $live.Priority
+            if (-not $desiredPriorities.ContainsKey($key)) {
+                [pscustomobject]@{
+                    Name                       = $live.Name
+                    Priority                   = $live.Priority
+                    Direction                  = $live.Direction
+                    Access                     = $live.Access
+                    Protocol                   = $live.Protocol
+                    SourcePortRanges           = @($live.SourcePortRanges)
+                    SourceAddressPrefixes      = @($live.SourceAddressPrefixes)
+                    DestinationAddressPrefixes = @($live.DestinationAddressPrefixes)
+                    DestinationPortRanges      = @($live.DestinationPortRanges)
+                    Reason                     = 'No workbook rule uses this direction and priority.'
+                }
+            }
+        }
+    ) | Sort-Object Direction, Priority, Name
 }
 
 function Save-Checkpoint {
@@ -2550,6 +2734,7 @@ function Invoke-ApplyPlan {
         [Parameter(Mandatory = $true)][string]$ResourceGroupName,
         [Parameter(Mandatory = $true)][string]$NsgName,
         [Parameter(Mandatory = $true)][string]$CheckpointPath,
+        [AllowEmptyCollection()][object[]]$UnmanagedNsgRules = @(),
         [string]$LatestCheckpointPath = '',
         [int]$RetryCount = 3,
         [int]$RetryDelaySeconds = 5,
@@ -2564,7 +2749,7 @@ function Invoke-ApplyPlan {
             Name           = $item.Name
             Priority       = $item.Priority
             PlannedAction  = $item.Action
-            Status         = if ($item.Action -eq 'NoChange') { 'Unchanged' } elseif ($item.Action -eq 'SkipApply') { 'SkippedShadowed' } elseif ($item.Action -eq 'Conflict') { 'BlockedConflict' } else { 'Pending' }
+            Status         = if ($item.Action -eq 'NoChange') { 'Unchanged' } elseif ($item.Action -eq 'Remove') { 'ReportedRemove' } elseif ($item.Action -eq 'SkipApply') { 'SkippedShadowed' } elseif ($item.Action -eq 'Conflict') { 'BlockedConflict' } else { 'Pending' }
             Reason         = $item.Reason
             LastUpdatedUtc = (Get-Date).ToUniversalTime().ToString('o')
         }
@@ -2578,6 +2763,10 @@ function Invoke-ApplyPlan {
             'Create' {
                 $executionEntry.After = $afterView
                 $executionEntry.Changes = @(Compare-RuleForCheckpoint -Before $null -After $afterView)
+            }
+            'Remove' {
+                $executionEntry.Before = $beforeView
+                $executionEntry.Changes = @(Compare-RuleForCheckpoint -Before $beforeView -After $null)
             }
             'SkipApply' {
                 if ($null -ne $beforeView) {
@@ -2608,6 +2797,7 @@ function Invoke-ApplyPlan {
         Mode              = if ($Apply) { 'Apply' } else { 'DryRun' }
         CheckpointPath    = $CheckpointPath
         LatestPath        = $LatestCheckpointPath
+        UnmanagedNsgRules = @($UnmanagedNsgRules)
     })
 
     foreach ($item in $Plan) {
@@ -2616,6 +2806,11 @@ function Invoke-ApplyPlan {
 
         if ($item.Action -eq 'NoChange') {
             Write-Log -Message "Unchanged $($item.Name) priority=$($item.Priority)" -Level INFO -Color Gray
+            continue
+        }
+
+        if ($item.Action -eq 'Remove') {
+            Write-Log -Message "ReportedRemove $($item.Name) priority=$($item.Priority) : $($item.Reason)" -Level WARN
             continue
         }
 
@@ -2673,6 +2868,7 @@ function Invoke-ApplyPlan {
                     Mode              = 'Apply'
                     CheckpointPath    = $CheckpointPath
                     LatestPath        = $LatestCheckpointPath
+                    UnmanagedNsgRules = @($UnmanagedNsgRules)
                 })
             }
         }
@@ -2686,6 +2882,7 @@ function Invoke-ApplyPlan {
                     Mode              = 'Apply'
                     CheckpointPath    = $CheckpointPath
                     LatestPath        = $LatestCheckpointPath
+                    UnmanagedNsgRules = @($UnmanagedNsgRules)
                 })
             }
 
@@ -2698,17 +2895,21 @@ function Invoke-ApplyPlan {
 
 function Show-PlanSummary {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Plan)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Plan,
+        [AllowEmptyCollection()][object[]]$UnmanagedNsgRules = @()
+    )
 
     $actionLabelMap = [ordered]@{
         Create    = 'PendingCreate'
         Update    = 'PendingUpdate'
+        Remove    = 'ReportedRemove'
         NoChange  = 'Unchanged'
         SkipApply = 'SkippedShadowed'
         Conflict  = 'BlockedConflict'
     }
 
-    $defaultActions = @('Create','Update','NoChange','SkipApply','Conflict')
+    $defaultActions = @('Create','Update','Remove','NoChange','SkipApply','Conflict')
     $presentActions = @($Plan | ForEach-Object { $_.Action } | Sort-Object -Unique)
     $extraActions = $presentActions | Where-Object { $defaultActions -notcontains $_ }
     $allActions = $defaultActions + $extraActions
@@ -2721,6 +2922,7 @@ function Show-PlanSummary {
         $label = if ($actionLabelMap.Contains($act)) { $actionLabelMap[$act] } else { $act }
         '{0,-16} : {1}' -f $label, $count | Write-Host
     }
+    '{0,-16} : {1}' -f 'Unmanaged', @($UnmanagedNsgRules).Count | Write-Host
     Write-Host ''
 }
 
@@ -2784,10 +2986,10 @@ function Resolve-NsgTarget {
 
     if ([string]::IsNullOrWhiteSpace($resolvedResourceGroupName) -or [string]::IsNullOrWhiteSpace($resolvedNsgName)) {
         $baseName = [System.IO.Path]::GetFileNameWithoutExtension($WorkbookPath)
-        $pattern = '^(?<ResourceGroupName>.+)__(?<NsgName>.+)_NetworkAccessRequest_v\d+$'
+        $pattern = '^(?<ResourceGroupName>.+)__(?<NsgName>.+)_NetworkAccessRequest_v\d+(?:\.\d+)*(?:\..+)?$'
 
         if ($baseName -notmatch $pattern) {
-            throw "ResourceGroupName or NsgName was not provided. Use explicit parameters or name the workbook '<resource-group>__<nsg-name>_NetworkAccessRequest_v<digits>.xlsx'. Actual filename: '$([System.IO.Path]::GetFileName($WorkbookPath))'."
+            throw "ResourceGroupName or NsgName was not provided. Use explicit parameters or a workbook starting with '<resource-group>__<nsg-name>_NetworkAccessRequest_v<number[.number...]>', optionally followed by dot suffixes before '.xlsx'. Actual filename: '$([System.IO.Path]::GetFileName($WorkbookPath))'."
         }
 
         if ([string]::IsNullOrWhiteSpace($resolvedResourceGroupName)) {
@@ -2840,8 +3042,10 @@ if ($FailOnShadowing -and $validation.Warnings.Count -gt 0) {
 Write-Log -Message "Loading current NSG rules from '$NsgName'" -Level INFO
 $liveRules = Get-LiveNsgRules -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
 
+$unmanagedNsgRules = @(Get-UnmanagedNsgRules -DesiredRules $desiredRules -LiveRules $liveRules)
+
 $plan = New-ApplyPlan -DesiredRules $desiredRules -LiveRules $liveRules -OverlapFindings $validation.OverlapFindings
-Show-PlanSummary -Plan $plan
+Show-PlanSummary -Plan $plan -UnmanagedNsgRules $unmanagedNsgRules
 
 $conflicts = @($plan | Where-Object { $_.Action -eq 'Conflict' })
 if ($conflicts.Count -gt 0) {
@@ -2851,7 +3055,7 @@ if ($conflicts.Count -gt 0) {
 }
 
 $approvalChanges = Convert-PlanToApprovalChanges -Plan $plan
-Save-ApprovalYaml -ApprovalChanges $approvalChanges -Path $ApprovalYamlPath
+Save-ApprovalYaml -ApprovalChanges $approvalChanges -UnmanagedNsgRules $unmanagedNsgRules -Path $ApprovalYamlPath
 
 $resolvedReviewWorkbookPath = Resolve-ReviewWorkbookPath `
     -WorkbookPath $WorkbookPath `
@@ -2861,6 +3065,7 @@ $resolvedReviewWorkbookPath = Set-WorkbookApprovalDiff `
     -WorkbookPath $WorkbookPath `
     -OutputPath $resolvedReviewWorkbookPath `
     -ApprovalChanges $approvalChanges `
+    -Plan $plan `
     -SheetNames $SheetNames
 
 
@@ -2870,7 +3075,11 @@ if (-not [string]::IsNullOrWhiteSpace($checkpointTargets.LatestPath)) {
     Write-Log -Message "Checkpoint latest file '$($checkpointTargets.LatestPath)' will also be updated." -Level INFO
 }
 
-$execution = Invoke-ApplyPlan -Plan $plan -ResourceGroupName $ResourceGroupName -NsgName $NsgName -CheckpointPath $checkpointTargets.RunPath -LatestCheckpointPath $checkpointTargets.LatestPath -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -Apply:$Apply
+$execution = Invoke-ApplyPlan -Plan $plan -UnmanagedNsgRules $unmanagedNsgRules -ResourceGroupName $ResourceGroupName -NsgName $NsgName -CheckpointPath $checkpointTargets.RunPath -LatestCheckpointPath $checkpointTargets.LatestPath -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -Apply:$Apply
+
+foreach ($unmanagedRule in $unmanagedNsgRules) {
+    Write-Log -Message "Unmanaged NSG rule '$($unmanagedRule.Name)' direction=$($unmanagedRule.Direction) priority=$($unmanagedRule.Priority)." -Level WARN
+}
 
 if ($PassThru) {
     $execution
