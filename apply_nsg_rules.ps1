@@ -27,7 +27,7 @@ Azure resource group that contains the target NSG. When omitted, it is read from
 .PARAMETER NsgName
 Name of the target Network Security Group. When omitted, it is read from WorkbookPath.
 
-The expected workbook filename is <resource-group>__<nsg-name>_NetworkAccessRequest_v<number[.number...]>.xlsx.
+The expected workbook filename starts with <resource-group>__<nsg-name>_NetworkAccessRequest_v<number[.number...]> and may include additional dot suffixes before .xlsx.
 The numeric suffix is validated as part of the naming convention but is not used by the script.
 
 .PARAMETER SheetNames
@@ -1265,6 +1265,10 @@ function Split-NormalizedList {
 function Test-ValidIpv4 {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Value)
+
+    if ($Value -notmatch '^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$') {
+        return $false
+    }
 
     $ip = $null
     return [System.Net.IPAddress]::TryParse($Value, [ref]$ip) -and $ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork
@@ -2951,10 +2955,10 @@ function Resolve-NsgTarget {
 
     if ([string]::IsNullOrWhiteSpace($resolvedResourceGroupName) -or [string]::IsNullOrWhiteSpace($resolvedNsgName)) {
         $baseName = [System.IO.Path]::GetFileNameWithoutExtension($WorkbookPath)
-        $pattern = '^(?<ResourceGroupName>.+)__(?<NsgName>.+)_NetworkAccessRequest_v\d+(?:\.\d+)*$'
+        $pattern = '^(?<ResourceGroupName>.+)__(?<NsgName>.+)_NetworkAccessRequest_v\d+(?:\.\d+)*(?:\..+)?$'
 
         if ($baseName -notmatch $pattern) {
-            throw "ResourceGroupName or NsgName was not provided. Use explicit parameters or name the workbook '<resource-group>__<nsg-name>_NetworkAccessRequest_v<number[.number...]>.xlsx'. Actual filename: '$([System.IO.Path]::GetFileName($WorkbookPath))'."
+            throw "ResourceGroupName or NsgName was not provided. Use explicit parameters or a workbook starting with '<resource-group>__<nsg-name>_NetworkAccessRequest_v<number[.number...]>', optionally followed by dot suffixes before '.xlsx'. Actual filename: '$([System.IO.Path]::GetFileName($WorkbookPath))'."
         }
 
         if ([string]::IsNullOrWhiteSpace($resolvedResourceGroupName)) {
@@ -3008,9 +3012,6 @@ Write-Log -Message "Loading current NSG rules from '$NsgName'" -Level INFO
 $liveRules = Get-LiveNsgRules -ResourceGroupName $ResourceGroupName -NsgName $NsgName -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds
 
 $unmanagedNsgRules = @(Get-UnmanagedNsgRules -DesiredRules $desiredRules -LiveRules $liveRules)
-foreach ($unmanagedRule in $unmanagedNsgRules) {
-    Write-Log -Message "Unmanaged NSG rule '$($unmanagedRule.Name)' direction=$($unmanagedRule.Direction) priority=$($unmanagedRule.Priority)." -Level WARN
-}
 
 $plan = New-ApplyPlan -DesiredRules $desiredRules -LiveRules $liveRules -OverlapFindings $validation.OverlapFindings
 Show-PlanSummary -Plan $plan -UnmanagedNsgRules $unmanagedNsgRules
@@ -3044,6 +3045,10 @@ if (-not [string]::IsNullOrWhiteSpace($checkpointTargets.LatestPath)) {
 }
 
 $execution = Invoke-ApplyPlan -Plan $plan -UnmanagedNsgRules $unmanagedNsgRules -ResourceGroupName $ResourceGroupName -NsgName $NsgName -CheckpointPath $checkpointTargets.RunPath -LatestCheckpointPath $checkpointTargets.LatestPath -RetryCount $RetryCount -RetryDelaySeconds $RetryDelaySeconds -Apply:$Apply
+
+foreach ($unmanagedRule in $unmanagedNsgRules) {
+    Write-Log -Message "Unmanaged NSG rule '$($unmanagedRule.Name)' direction=$($unmanagedRule.Direction) priority=$($unmanagedRule.Priority)." -Level WARN
+}
 
 if ($PassThru) {
     $execution
