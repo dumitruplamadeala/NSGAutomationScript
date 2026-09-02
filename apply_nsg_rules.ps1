@@ -596,6 +596,17 @@ function Resolve-ReviewWorkbookPath {
     return Join-Path -Path $parent -ChildPath $reviewFileName
 }
 
+function ConvertTo-ExcelDiffValue {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    if ($Value -match '^(?<Address>[0-9]{1,3}(?:\.[0-9]{1,3}){3})/32$') {
+        return $Matches.Address
+    }
+
+    return $Value
+}
+
 function Convert-ApprovalItemToExcelDiff {
     [CmdletBinding()]
     param(
@@ -641,7 +652,7 @@ function Convert-ApprovalItemToExcelDiff {
             $lines.Add('    Removed:')
 
             foreach ($removedValue in $removedValues) {
-                $yamlValue = ConvertTo-YamlScalar -Value $removedValue
+                $yamlValue = ConvertTo-YamlScalar -Value (ConvertTo-ExcelDiffValue -Value $removedValue)
                 $lines.Add("      - $yamlValue")
             }
         }
@@ -650,7 +661,7 @@ function Convert-ApprovalItemToExcelDiff {
             $lines.Add('    Added:')
 
             foreach ($addedValue in $addedValues) {
-                $yamlValue = ConvertTo-YamlScalar -Value $addedValue
+                $yamlValue = ConvertTo-YamlScalar -Value (ConvertTo-ExcelDiffValue -Value $addedValue)
                 $lines.Add("      - $yamlValue")
             }
         }
@@ -861,7 +872,27 @@ function Set-WorkbookApprovalDiff {
                 throw "Worksheet '$($planItem.Desired.SourceSheet)' does not contain the required 'Action' column."
             }
 
-            $worksheet.Cells[[int]$planItem.Desired.OriginalRow, $actionColumnNumber].Value = Get-WorkbookActionForPlanItem -PlanItem $planItem
+            $targetRow = [int]$planItem.Desired.OriginalRow
+            $resolvedAction = Get-WorkbookActionForPlanItem -PlanItem $planItem
+            $worksheet.Cells[$targetRow, $actionColumnNumber].Value = $resolvedAction
+
+            if ($planItem.Desired.RequestedAction -eq 'Update' -and $resolvedAction -eq 'No-Change') {
+                $targetRowRange = $worksheet.Cells[$targetRow, 1, $targetRow, $worksheet.Dimension.End.Column]
+                $targetRowRange.Style.Font.Bold = $false
+                $targetRowRange.Style.Font.Color.SetColor([System.Drawing.Color]::Black)
+
+                for ($columnNumber = 1; $columnNumber -le $worksheet.Dimension.End.Column; $columnNumber++) {
+                    $targetCell = $worksheet.Cells[$targetRow, $columnNumber]
+                    if (-not $targetCell.IsRichText) {
+                        continue
+                    }
+
+                    foreach ($richTextRun in $targetCell.RichText) {
+                        $richTextRun.Bold = $false
+                        $richTextRun.Color = [System.Drawing.Color]::Black
+                    }
+                }
+            }
         }
 
         $package.Save()
