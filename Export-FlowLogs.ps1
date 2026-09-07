@@ -10,7 +10,7 @@ using configurable time-based intervals. The script:
 - Automatically retries an oversized chunk with smaller day-based intervals.
 - Supports filtering by flow status, such as Denied or Allowed.
 - Saves the generated query interval and execution logs.
-- Uses temporary chunk CSV files while the export is running.
+- Uses temporary chunk TSV files while the export is running.
 - Re-aggregates all chunk results into a single server-specific CSV file.
 - Prevents stale data from previous executions by using a timestamped output
   directory for each run.
@@ -104,12 +104,12 @@ function Invoke-LogAnalyticsQuery {
     param(
         [string]$WorkspaceId,
         [string]$Query,
+        [string]$OutputPath,
         [string]$LogFilePath
     )
 
-    # Keep stdout and stderr separate. Only stdout is parsed as JSON.
+    # Keep stdout and stderr separate. Python parses the TSV chunk later.
     $tempDirectory = [System.IO.Path]::GetTempPath()
-    $stdoutPath = Join-Path $tempDirectory ("{0}.stdout" -f [guid]::NewGuid())
     $stderrPath = Join-Path $tempDirectory ("{0}.stderr" -f [guid]::NewGuid())
     $logReference = if ([string]::IsNullOrWhiteSpace($LogFilePath)) {
         ""
@@ -128,16 +128,11 @@ function Invoke-LogAnalyticsQuery {
         & az monitor log-analytics query `
             --workspace $WorkspaceId `
             --analytics-query $queryArgument `
-            --output json `
-            1> $stdoutPath `
+            --output tsv `
+            1> $OutputPath `
             2> $stderrPath
 
         $exitCode = $LASTEXITCODE
-        $jsonText = if (Test-Path -LiteralPath $stdoutPath) {
-            Get-Content -LiteralPath $stdoutPath -Raw
-        }
-        else { "" }
-
         $stderrText = if (Test-Path -LiteralPath $stderrPath) {
             Get-Content -LiteralPath $stderrPath -Raw
         }
@@ -146,7 +141,7 @@ function Invoke-LogAnalyticsQuery {
         if (-not [string]::IsNullOrWhiteSpace($LogFilePath)) {
             @(
                 "=== STDOUT ==="
-                $jsonText
+                (Get-Content -LiteralPath $OutputPath -Raw -ErrorAction SilentlyContinue)
                 ""
                 "=== STDERR ==="
                 $stderrText
@@ -157,101 +152,24 @@ function Invoke-LogAnalyticsQuery {
             throw "Azure CLI query failed with exit code $exitCode. $stderrText$logReference"
         }
 
-        if ([string]::IsNullOrWhiteSpace($jsonText)) {
-            throw "Azure CLI returned an empty response.$logReference"
+        $rowCount = 0
+        foreach ($line in [System.IO.File]::ReadLines($OutputPath)) {
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                continue
+            }
+
+            # The CLI can emit the result-table name as a metadata line.
+            if ($line -eq "PrimaryResult") {
+                continue
+            }
+
+            $rowCount++
         }
 
-        try {
-            return ($jsonText | ConvertFrom-Json)
-        }
-        catch {
-            throw "Azure CLI returned invalid JSON.$logReference"
-        }
+        return $rowCount
     }
     finally {
-        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Convert-LogAnalyticsTableToObjects {
-    param($Response)
-
-    if ($null -eq $Response) {
-        return @()
-    }
-
-    $responseItems = @($Response)
-
-    if ($responseItems.Count -eq 0) {
-        return @()
-    }
-
-    $Response = $responseItems[0]
-
-    if ($Response -is [psobject]) {
-        $firstItemProperties = @($Response.PSObject.Properties.Name)
-
-        if ($firstItemProperties -contains "SrcEff") {
-            return @($responseItems | ForEach-Object {
-                $_.PSObject.Properties.Remove("TableName")
-                $_
-            })
-        }
-    }
-
-    if ($Response -isnot [psobject]) {
-        return @()
-    }
-
-    $properties = @($Response.PSObject.Properties.Name)
-
-    if (($properties -contains "error") -and $Response.error) {
-        throw "Log Analytics returned an error: $($Response.error | ConvertTo-Json -Compress)"
-    }
-
-    if (($properties -notcontains "tables") -or -not $Response.tables -or $Response.tables.Count -eq 0) {
-        return @()
-    }
-
-    $table = $Response.tables[0]
-    $tableProperties = @($table.PSObject.Properties.Name)
-
-    if (($tableProperties -notcontains "columns") -or -not $table.columns) {
-        return @()
-    }
-
-    $columnNames = @($table.columns | ForEach-Object {
-        if ($_ -is [string]) { $_ } else { $_.name }
-    })
-
-    if (($tableProperties -notcontains "rows") -or -not $table.rows) {
-        return @()
-    }
-
-    foreach ($row in $table.rows) {
-        $object = [ordered]@{}
-        for ($i = 0; $i -lt $columnNames.Count; $i++) {
-            $object[$columnNames[$i]] = $row[$i]
-        }
-        [pscustomobject]$object
-    }
-}
-
-function Assert-ExpectedColumns {
-    param([object[]]$Rows)
-
-    if ($Rows.Count -eq 0) { return }
-
-    $required = @(
-        "SrcEff", "DestEff", "DestPort", "L4Protocol",
-        "Server", "SrcPorts", "Requests"
-    )
-    $actual = @($Rows[0].PSObject.Properties.Name)
-
-    foreach ($column in $required) {
-        if ($actual -notcontains $column) {
-            throw "Required KQL result column '$column' is missing. Returned columns: $($actual -join ', ')"
-        }
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -261,13 +179,6 @@ function Test-RetryableQueryLimitError {
     $message = [string]$ErrorRecord.Exception.Message
 
     return $message -match '(?i)(500000|64\s*MB|too\s+many|too\s+large|result.{0,30}(limit|size)|response.{0,30}(limit|size)|maximum.{0,30}(row|record|size)|truncat|exceed.{0,20}(limit|size))'
-}
-
-function Export-ObjectsToCsv {
-    param([object[]]$Objects, [string]$Path)
-    if ($Objects.Count -gt 0) {
-        $Objects | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
-    }
 }
 
 # Validation
@@ -312,7 +223,7 @@ $runDirectory = Join-Path $OutputDirectory (Get-Date -Format "yyyyMMdd_HHmmss")
 $logDirectory = Join-Path $runDirectory "logs"
 $stagingDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("nsg-flow-export-{0}" -f [guid]::NewGuid())
 $chunkDirectory = Join-Path $stagingDirectory "chunks"
-$directoriesToCreate = @($chunkDirectory)
+$directoriesToCreate = @($runDirectory, $chunkDirectory)
 if (-not $DisableQueryLogs) {
     $directoriesToCreate += $logDirectory
 }
@@ -352,7 +263,7 @@ while ($currentStart -lt $exportEnd) {
         $chunkLabel = "{0:D4}_{1}_{2}" -f $chunkNumber,
             $currentStart.ToString("yyyyMMddHHmmss"),
             $candidateEnd.ToString("yyyyMMddHHmmss")
-        $chunkCsv = Join-Path $chunkDirectory "$chunkLabel.csv"
+        $chunkTsv = Join-Path $chunkDirectory "$chunkLabel.tsv"
         $queryLog = if ($DisableQueryLogs) {
             $null
         }
@@ -363,9 +274,7 @@ while ($currentStart -lt $exportEnd) {
         Write-Host "Query interval: $startText to $endText ($currentChunkDays day(s))"
 
         try {
-            $response = Invoke-LogAnalyticsQuery $WorkspaceId $query $queryLog
-            $rows = @(Convert-LogAnalyticsTableToObjects $response)
-            Assert-ExpectedColumns $rows
+            $rowCount = Invoke-LogAnalyticsQuery $WorkspaceId $query $chunkTsv $queryLog
         }
         catch {
             if (-not (Test-RetryableQueryLimitError $_)) {
@@ -386,7 +295,7 @@ while ($currentStart -lt $exportEnd) {
             continue
         }
 
-        if ($rows.Count -ge $SafetyRowLimit) {
+        if ($rowCount -ge $SafetyRowLimit) {
             if ($currentChunkDays -le $MinimumChunkDays) {
                 throw "The minimum interval still returned at least $SafetyRowLimit rows: $startText to $endText"
             }
@@ -397,13 +306,15 @@ while ($currentStart -lt $exportEnd) {
                 [double]$MinimumChunkDays
             )
 
-            Write-Warning "Interval returned $($rows.Count) rows. Retrying with $currentChunkDays day(s)."
+            Write-Warning "Interval returned $rowCount rows. Retrying with $currentChunkDays day(s)."
             continue
         }
 
-        if ($rows.Count -gt 0) {
-            Export-ObjectsToCsv $rows $chunkCsv
-            $chunkFiles.Add($chunkCsv)
+        if ($rowCount -gt 0) {
+            $chunkFiles.Add($chunkTsv)
+        }
+        else {
+            Remove-Item -LiteralPath $chunkTsv -Force -ErrorAction SilentlyContinue
         }
 
         $currentStart = $candidateEnd

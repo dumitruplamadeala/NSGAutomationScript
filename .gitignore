@@ -15,3 +15,4 @@ Desktop.ini
 **.csv
 **.log
 venv/
+__pycache__/
