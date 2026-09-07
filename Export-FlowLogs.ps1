@@ -10,7 +10,7 @@ using configurable time-based intervals. The script:
 - Automatically retries an oversized chunk with smaller day-based intervals.
 - Supports filtering by flow status, such as Denied or Allowed.
 - Saves the generated query interval and execution logs.
-- Stores each successful query result as an individual chunk CSV file.
+- Uses temporary chunk CSV files while the export is running.
 - Re-aggregates all chunk results into a single server-specific CSV file.
 - Prevents stale data from previous executions by using a timestamped output
   directory for each run.
@@ -52,9 +52,7 @@ The Azure CLI extension is currently preview-only. It must be installed in
 every environment where the script is executed, including Synopsys agents or
 other CI/CD execution environments.
 
-The script does not silently discard records. If the final aggregated result
-exceeds the configured generator limit, the execution fails and requires the
-input or generator configuration to be reviewed.
+The final CSV contains every aggregated flow row.
 
 The Azure CLI must be authenticated before running the script, for example:
 
@@ -73,7 +71,8 @@ param(
     [ValidateSet("Allowed", "Denied")]
     [string]$FlowStatus = "Denied",
     [int]$SafetyRowLimit = 450000,
-    [int]$GeneratorRowLimit = 50000
+    [string]$PythonExecutable = ".\venv\Scripts\python.exe",
+    [switch]$DisableQueryLogs
 )
 
 Set-StrictMode -Version Latest
@@ -109,9 +108,15 @@ function Invoke-LogAnalyticsQuery {
     )
 
     # Keep stdout and stderr separate. Only stdout is parsed as JSON.
-    $tempDirectory = Split-Path -Parent $LogFilePath
+    $tempDirectory = [System.IO.Path]::GetTempPath()
     $stdoutPath = Join-Path $tempDirectory ("{0}.stdout" -f [guid]::NewGuid())
     $stderrPath = Join-Path $tempDirectory ("{0}.stderr" -f [guid]::NewGuid())
+    $logReference = if ([string]::IsNullOrWhiteSpace($LogFilePath)) {
+        ""
+    }
+    else {
+        " See: $LogFilePath"
+    }
 
     try {
         # az.cmd on Windows can misparse embedded double quotes in a dynamic
@@ -138,27 +143,29 @@ function Invoke-LogAnalyticsQuery {
         }
         else { "" }
 
-        @(
-            "=== STDOUT ==="
-            $jsonText
-            ""
-            "=== STDERR ==="
-            $stderrText
-        ) | Out-File -LiteralPath $LogFilePath -Encoding utf8
+        if (-not [string]::IsNullOrWhiteSpace($LogFilePath)) {
+            @(
+                "=== STDOUT ==="
+                $jsonText
+                ""
+                "=== STDERR ==="
+                $stderrText
+            ) | Out-File -LiteralPath $LogFilePath -Encoding utf8
+        }
 
         if ($exitCode -ne 0) {
-            throw "Azure CLI query failed with exit code $exitCode. See: $LogFilePath"
+            throw "Azure CLI query failed with exit code $exitCode. $stderrText$logReference"
         }
 
         if ([string]::IsNullOrWhiteSpace($jsonText)) {
-            throw "Azure CLI returned an empty response. See: $LogFilePath"
+            throw "Azure CLI returned an empty response.$logReference"
         }
 
         try {
             return ($jsonText | ConvertFrom-Json)
         }
         catch {
-            throw "Azure CLI returned invalid JSON. See: $LogFilePath"
+            throw "Azure CLI returned invalid JSON.$logReference"
         }
     }
     finally {
@@ -248,6 +255,14 @@ function Assert-ExpectedColumns {
     }
 }
 
+function Test-RetryableQueryLimitError {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $message = [string]$ErrorRecord.Exception.Message
+
+    return $message -match '(?i)(500000|64\s*MB|too\s+many|too\s+large|result.{0,30}(limit|size)|response.{0,30}(limit|size)|maximum.{0,30}(row|record|size)|truncat|exceed.{0,20}(limit|size))'
+}
+
 function Export-ObjectsToCsv {
     param([object[]]$Objects, [string]$Path)
     if ($Objects.Count -gt 0) {
@@ -255,56 +270,15 @@ function Export-ObjectsToCsv {
     }
 }
 
-function Get-FlowKey {
-    param($Row)
-    [ordered]@{
-        SrcEff = [string]$Row.SrcEff
-        DestEff = [string]$Row.DestEff
-        DestPort = [string]$Row.DestPort
-        L4Protocol = [string]$Row.L4Protocol
-        Server = [string]$Row.Server
-        SrcPorts = [string]$Row.SrcPorts
-    } | ConvertTo-Json -Compress
-}
-
-function Merge-FlowRows {
-    param([string[]]$ChunkFiles, [string]$FinalCsvPath)
-
-    Write-Step "Re-aggregating flow-log chunks"
-    $aggregated = @{}
-
-    foreach ($chunkFile in $ChunkFiles) {
-        Write-Host "Reading: $chunkFile"
-        foreach ($row in (Import-Csv -LiteralPath $chunkFile)) {
-            $key = Get-FlowKey $row
-
-            if (-not $aggregated.ContainsKey($key)) {
-                $aggregated[$key] = [ordered]@{
-                    SrcEff = $row.SrcEff; DestEff = $row.DestEff
-                    DestPort = $row.DestPort; L4Protocol = $row.L4Protocol
-                    Server = $row.Server; SrcPorts = $row.SrcPorts
-                    Requests = [long]0
-                }
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace([string]$row.Requests)) {
-                $aggregated[$key].Requests += [long]$row.Requests
-            }
-        }
-    }
-
-    $result = @($aggregated.Values |
-        ForEach-Object { [pscustomobject]$_ } |
-        Sort-Object -Property Requests -Descending)
-
-    $result | Export-Csv -LiteralPath $FinalCsvPath -NoTypeInformation -Encoding UTF8
-    Write-Host "Final aggregated rows: $($result.Count)"
-    return $result.Count
-}
-
 # Validation
 Write-Step "Validating configuration"
 Assert-CommandExists "az"
+Assert-CommandExists $PythonExecutable
+$aggregationScript = Join-Path $PSScriptRoot "aggregate_flow_logs.py"
+
+if (-not (Test-Path -LiteralPath $aggregationScript -PathType Leaf)) {
+    throw "Python aggregation script was not found: $aggregationScript"
+}
 
 if (-not (Test-Path -LiteralPath $QueryTemplatePath -PathType Leaf)) {
     throw "KQL query template was not found: $QueryTemplatePath"
@@ -315,8 +289,8 @@ if ($HistoryDays -le 0 -or $ChunkDays -le 0 -or $MinimumChunkDays -le 0) {
 if ($MinimumChunkDays -gt $ChunkDays) {
     throw "MinimumChunkDays must be less than or equal to ChunkDays."
 }
-if ($SafetyRowLimit -le 0 -or $GeneratorRowLimit -le 0) {
-    throw "SafetyRowLimit and GeneratorRowLimit must be greater than zero."
+if ($SafetyRowLimit -le 0) {
+    throw "SafetyRowLimit must be greater than zero."
 }
 if ($SafetyRowLimit -ge 500000) {
     throw "SafetyRowLimit must be below Azure's 500,000-row limit."
@@ -332,13 +306,18 @@ if ($queryTemplate -match "(?i)\|\s*take\s+\d+") {
     throw "Remove the '| take ...' operator from the KQL template. Apply any final limit only after aggregation."
 }
 
-# Every execution gets an isolated directory, preventing stale chunks from being reused.
+# Every execution gets an isolated output directory. Intermediate chunks and the
+# aggregation database are kept in a temporary staging directory instead.
 $runDirectory = Join-Path $OutputDirectory (Get-Date -Format "yyyyMMdd_HHmmss")
-$chunkDirectory = Join-Path $runDirectory "chunks"
 $logDirectory = Join-Path $runDirectory "logs"
-New-Item -ItemType Directory -Path $chunkDirectory, $logDirectory -Force | Out-Null
+$stagingDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("nsg-flow-export-{0}" -f [guid]::NewGuid())
+$chunkDirectory = Join-Path $stagingDirectory "chunks"
+$directoriesToCreate = @($chunkDirectory)
+if (-not $DisableQueryLogs) {
+    $directoriesToCreate += $logDirectory
+}
+New-Item -ItemType Directory -Path $directoriesToCreate -Force | Out-Null
 
-# q41-mtax -> Q41. Change this to an explicit parameter if naming differs.
 $serverFilter = $ServerName.Split("-")[0].ToUpperInvariant()
 $exportEnd = [datetime]::UtcNow
 $exportStart = $exportEnd.AddDays(-$HistoryDays)
@@ -374,12 +353,38 @@ while ($currentStart -lt $exportEnd) {
             $currentStart.ToString("yyyyMMddHHmmss"),
             $candidateEnd.ToString("yyyyMMddHHmmss")
         $chunkCsv = Join-Path $chunkDirectory "$chunkLabel.csv"
-        $queryLog = Join-Path $logDirectory "$chunkLabel.log"
+        $queryLog = if ($DisableQueryLogs) {
+            $null
+        }
+        else {
+            Join-Path $logDirectory "$chunkLabel.log"
+        }
 
         Write-Host "Query interval: $startText to $endText ($currentChunkDays day(s))"
-        $response = Invoke-LogAnalyticsQuery $WorkspaceId $query $queryLog
-        $rows = @(Convert-LogAnalyticsTableToObjects $response)
-        Assert-ExpectedColumns $rows
+
+        try {
+            $response = Invoke-LogAnalyticsQuery $WorkspaceId $query $queryLog
+            $rows = @(Convert-LogAnalyticsTableToObjects $response)
+            Assert-ExpectedColumns $rows
+        }
+        catch {
+            if (-not (Test-RetryableQueryLimitError $_)) {
+                throw
+            }
+
+            if ($currentChunkDays -le $MinimumChunkDays) {
+                throw "The minimum interval still exceeded the Azure query result limit: $startText to $endText. See: $queryLog"
+            }
+
+            $chunkNumber--
+            $currentChunkDays = [math]::Max(
+                [math]::Floor($currentChunkDays / 2),
+                [double]$MinimumChunkDays
+            )
+
+            Write-Warning "Azure returned a result-size/row-limit error. Retrying with $currentChunkDays day(s). See: $queryLog"
+            continue
+        }
 
         if ($rows.Count -ge $SafetyRowLimit) {
             if ($currentChunkDays -le $MinimumChunkDays) {
@@ -413,11 +418,37 @@ if ($chunkFiles.Count -eq 0) {
     $finalRowCount = 0
 }
 else {
-    $finalRowCount = Merge-FlowRows $chunkFiles.ToArray() $finalCsv
+    $aggregationDatabase = Join-Path $stagingDirectory "flow-aggregation.sqlite"
+
+    Write-Step "Aggregating flow-log chunks with Python"
+
+    $pythonOutput = @(& $PythonExecutable $aggregationScript `
+        --chunk-directory $chunkDirectory `
+        --output-csv $finalCsv `
+        --database $aggregationDatabase)
+
+    $pythonOutput | ForEach-Object { Write-Host $_ }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python flow-log aggregation failed with exit code $LASTEXITCODE."
+    }
+
+    $countLine = $pythonOutput |
+        Where-Object { $_ -match "^Final aggregated rows:\s+(\d+)" } |
+        Select-Object -First 1
+
+    if ($countLine -and $countLine -match "(\d+)$") {
+        $finalRowCount = [int64]$Matches[1]
+    }
+    else {
+        throw "Python aggregation completed but did not return the final row count."
+    }
 }
 
-if ($finalRowCount -gt $GeneratorRowLimit) {
-    throw "Final aggregated result contains $finalRowCount rows, exceeding the generator limit of $GeneratorRowLimit. No rows were discarded."
+# Intermediate chunks and the SQLite aggregation database are implementation
+# details and must not remain in the export output.
+if (Test-Path -LiteralPath $stagingDirectory) {
+    Remove-Item -LiteralPath $stagingDirectory -Recurse -Force
 }
 
 $elapsed = (Get-Date) - $scriptStart
