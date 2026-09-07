@@ -12,3 +12,6 @@
 # Windows Explorer metadata
 Thumbs.db
 Desktop.ini
+**.csv
+**.log
+venv/
