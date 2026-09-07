@@ -1,0 +1,16 @@
+NTANetAnalytics
+| where TimeGenerated >= datetime({{START_UTC}})
+  and TimeGenerated < datetime({{END_UTC}})
+| where FlowStatus == "{{FLOW_STATUS}}"
+| where FlowDirection == "Inbound"
+| where AclRule != "platformrule"
+| where DestVm contains "{{SERVER_FILTER}}"
+| extend SrcEff = iff(
+  isempty(SrcIp) and isnotempty(SrcPublicIps),
+    split(SrcPublicIps, "|")[0],
+    SrcIp
+)
+| extend DestEff = DestIp
+| extend Server = tostring(split(DestVm, "/")[-1])
+| summarize Requests = count()
+    by SrcEff, DestEff, DestPort, L4Protocol, Server, SrcPorts
