@@ -7,6 +7,7 @@ Executes a parameterized KQL query against an Azure Log Analytics workspace
 using configurable time-based intervals. The script:
 
 - Queries the workspace in manageable time chunks.
+- Automatically retries an oversized chunk with smaller day-based intervals.
 - Supports filtering by flow status, such as Denied or Allowed.
 - Saves the generated query interval and execution logs.
 - Stores each successful query result as an individual chunk CSV file.
@@ -68,6 +69,7 @@ param(
     [Parameter(Mandatory)] [string]$OutputDirectory,
     [int]$HistoryDays = 180,
     [int]$ChunkDays = 14,
+    [int]$MinimumChunkDays = 1,
     [ValidateSet("Allowed", "Denied")]
     [string]$FlowStatus = "Denied",
     [int]$SafetyRowLimit = 450000,
@@ -307,8 +309,11 @@ Assert-CommandExists "az"
 if (-not (Test-Path -LiteralPath $QueryTemplatePath -PathType Leaf)) {
     throw "KQL query template was not found: $QueryTemplatePath"
 }
-if ($HistoryDays -le 0 -or $ChunkDays -le 0) {
-    throw "HistoryDays and ChunkDays must be greater than zero."
+if ($HistoryDays -le 0 -or $ChunkDays -le 0 -or $MinimumChunkDays -le 0) {
+    throw "HistoryDays, ChunkDays, and MinimumChunkDays must be greater than zero."
+}
+if ($MinimumChunkDays -gt $ChunkDays) {
+    throw "MinimumChunkDays must be less than or equal to ChunkDays."
 }
 if ($SafetyRowLimit -le 0 -or $GeneratorRowLimit -le 0) {
     throw "SafetyRowLimit and GeneratorRowLimit must be greater than zero."
@@ -377,7 +382,18 @@ while ($currentStart -lt $exportEnd) {
         Assert-ExpectedColumns $rows
 
         if ($rows.Count -ge $SafetyRowLimit) {
-            throw "Query interval returned at least $SafetyRowLimit rows: $startText to $endText. Retry with a smaller ChunkDays value."
+            if ($currentChunkDays -le $MinimumChunkDays) {
+                throw "The minimum interval still returned at least $SafetyRowLimit rows: $startText to $endText"
+            }
+
+            $chunkNumber--
+            $currentChunkDays = [math]::Max(
+                [math]::Floor($currentChunkDays / 2),
+                [double]$MinimumChunkDays
+            )
+
+            Write-Warning "Interval returned $($rows.Count) rows. Retrying with $currentChunkDays day(s)."
+            continue
         }
 
         if ($rows.Count -gt 0) {
