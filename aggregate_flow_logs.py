@@ -76,24 +76,45 @@ def aggregate(
                     if row == ["PrimaryResult"]:
                         continue
 
-                    if len(row) == len(EXPECTED_COLUMNS) + 1 and row[-1] == "PrimaryResult":
-                        row = row[:-1]
+                    if len(row) == 2 and row[1] == "PrimaryResult":
+                        row = row[:1]
 
-                    if len(row) != len(EXPECTED_COLUMNS):
+                    if len(row) != 1:
                         raise RuntimeError(
                             f"Unexpected column count in {chunk_file.name} line "
-                            f"{line_number}: {len(row)}, expected {len(EXPECTED_COLUMNS)}"
+                            f"{line_number}: {len(row)}, expected one payload column"
+                        )
+
+                    values = row[0].split("|")
+                    if len(values) != len(EXPECTED_COLUMNS):
+                        raise RuntimeError(
+                            f"Unexpected payload field count in {chunk_file.name} line "
+                            f"{line_number}: {len(values)}, expected {len(EXPECTED_COLUMNS)}"
+                        )
+
+                    try:
+                        requests = int(values[6] or 0)
+                    except ValueError as error:
+                        raise RuntimeError(
+                            f"Invalid Requests value in {chunk_file.name} line "
+                            f"{line_number}: {values[6]!r}"
+                        ) from error
+
+                    if requests < 1:
+                        raise RuntimeError(
+                            f"Requests must be positive in {chunk_file.name} line "
+                            f"{line_number}: {requests}"
                         )
 
                     batch.append(
                         (
-                            row[0] or "",
-                            row[1] or "",
-                            row[2] or "",
-                            row[3] or "",
-                            row[4] or "",
-                            row[5] or "",
-                            int(row[6] or 0),
+                            values[0] or "",
+                            values[1] or "",
+                            values[2] or "",
+                            values[3] or "",
+                            values[4] or "",
+                            values[5] or "",
+                            requests,
                         )
                     )
                     processed += 1
